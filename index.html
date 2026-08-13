@@ -155,6 +155,15 @@ button:disabled{opacity:.45;cursor:not-allowed}
   font-size:12px;
 }
 .bubble.system.error{color:var(--err);border-color:var(--err)}
+.bubble.system.dim{
+  align-self:flex-start;
+  background:transparent;
+  border:none;
+  color:var(--dim);
+  font-size:11px;
+  padding:1px 2px;
+  text-align:left;
+}
 .bubble.system a{color:var(--accent);overflow-wrap:anywhere}
 .bubble .md-body{white-space:pre-wrap}
 .bubble .md-label{
@@ -233,13 +242,14 @@ button:disabled{opacity:.45;cursor:not-allowed}
   white-space:nowrap;
 }
 .model-chip:hover{border-color:var(--accent)}
-#modelPopover{
+#modelPopover,
+#repoPopover{
   position:absolute;
   left:0;
   bottom:calc(100% + 8px);
   z-index:20;
-  min-width:280px;
-  max-width:340px;
+  min-width:300px;
+  max-width:360px;
   max-height:60vh;
   overflow-y:auto;
   background:var(--panel);
@@ -248,9 +258,12 @@ button:disabled{opacity:.45;cursor:not-allowed}
   padding:12px;
   box-shadow:0 10px 30px rgba(0,0,0,.55);
 }
-#modelPopover[hidden]{display:none}
-#modelPopover [hidden]{display:none}
-#modelPopover label{
+#modelPopover[hidden],
+#repoPopover[hidden]{display:none}
+#modelPopover [hidden],
+#repoPopover [hidden]{display:none}
+#modelPopover label,
+#repoPopover label{
   display:block;
   color:var(--dim);
   font-size:10px;
@@ -259,7 +272,9 @@ button:disabled{opacity:.45;cursor:not-allowed}
   margin:6px 0 3px;
 }
 #modelPopover select,
-#modelPopover input{
+#modelPopover input,
+#repoPopover select,
+#repoPopover input{
   width:100%;
   background:var(--bg2);
   color:var(--fg);
@@ -270,7 +285,17 @@ button:disabled{opacity:.45;cursor:not-allowed}
   font-size:12px;
 }
 #modelPopover select:focus,
-#modelPopover input:focus{outline:none;border-color:var(--accent)}
+#modelPopover input:focus,
+#repoPopover select:focus,
+#repoPopover input:focus{outline:none;border-color:var(--accent)}
+#modelPopover .pop-hint,
+#repoPopover .pop-hint{
+  color:var(--dim);
+  font-size:11px;
+  line-height:1.6;
+  margin:8px 0 0;
+}
+#repoSpecInput.invalid{border-color:var(--err)}
 #input{
   flex:1;
   resize:none;
@@ -307,43 +332,55 @@ button:disabled{opacity:.45;cursor:not-allowed}
   <div id="status"><span class="dot"></span><span id="statusText">idle</span></div>
 
   <div id="settings">
-    <label for="owner">owner</label>
+    <label for="owner">relay owner</label>
     <input id="owner" type="text" autocomplete="off" spellcheck="false">
-    <label for="repo">repo</label>
+    <label for="repo">relay repo</label>
     <input id="repo" type="text" autocomplete="off" spellcheck="false">
-    <label for="branch">branch</label>
+    <label for="branch">relay branch</label>
     <input id="branch" type="text" autocomplete="off" spellcheck="false">
-    <label for="token">personal access token (PAT)</label>
+    <label for="token">GitHub personal access token (PAT)</label>
     <input id="token" type="password" autocomplete="off" spellcheck="false">
-    <p class="hint">Create a token at <a href="https://github.com/settings/personal-access-tokens" target="_blank" rel="noopener">github.com/settings/personal-access-tokens</a>.
+    <label for="repoSpec">target repository (agent workspace) — owner/repo or owner/repo@branch</label>
+    <input id="repoSpec" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. jonlocapo/OpenLink@main">
+    <label for="apikey">OpenCode Go API key (optional)</label>
+    <input id="apikey" type="password" autocomplete="off" spellcheck="false">
+    <p class="hint">Create the PAT at <a href="https://github.com/settings/personal-access-tokens" target="_blank" rel="noopener">github.com/settings/personal-access-tokens</a>.
     Fine-grained PAT: grant this repository the <strong>Actions → Workflows: read and write</strong> permission.
     Classic PAT: tick the <strong>workflow</strong> scope.
-    The token is stored only in this browser's localStorage — never in the URL, the history, or the hash.</p>
+    The PAT is stored only in this browser's localStorage — never in the URL, the history, or the hash.<br><br>
+    <strong>Target repository:</strong> a public GitHub repo the agent works on. It is cloned fresh on the runner each run; the agent's edits persist to the relay repo's <code>workspace/&lt;session&gt;</code> branch. Leave empty to work inside the relay repo itself.<br><br>
+    <strong>API key:</strong> prefer a repo secret <code>OPENCODE_API_KEY</code> (never leaves GitHub). A key pasted here is sent as a workflow input and is visible on the public Actions run page — only use it if the repo is private or you accept that exposure.</p>
   </div>
 
   <div id="chat"></div>
 
   <div id="composer">
     <div id="toolbar">
+      <button id="repoBtn" class="model-chip" type="button" title="Choose target repository"></button>
       <button id="modelBtn" class="model-chip" type="button" title="Choose model and variant"></button>
+      <div id="repoPopover" hidden>
+        <label for="repoSpecInput">target repository (agent workspace)</label>
+        <input id="repoSpecInput" type="text" autocomplete="off" spellcheck="false" placeholder="owner/repo or owner/repo@branch">
+        <p class="pop-hint">Public GitHub repo the agent works on. Cloned fresh on the runner each run; the agent's edits persist to the relay repo's <code>workspace/&lt;session&gt;</code> branch. Leave empty to work inside the relay repo.</p>
+      </div>
+      <div id="modelPopover" hidden>
+        <label for="modelSelect">model</label>
+        <select id="modelSelect"></select>
+        <div id="variantWrap">
+          <label for="variantSelect">variant</label>
+          <select id="variantSelect"></select>
+        </div>
+        <div id="customFields" hidden>
+          <label for="customModelInput">custom model id</label>
+          <input id="customModelInput" type="text" autocomplete="off" spellcheck="false" placeholder="provider/model-id">
+          <label for="customVariantInput">variant (optional)</label>
+          <input id="customVariantInput" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. long">
+        </div>
+      </div>
     </div>
     <div id="composerRow">
       <textarea id="input" rows="1" placeholder="Ask the agent something… (Enter to send, Shift+Enter for a new line)"></textarea>
       <button id="sendBtn" disabled>Send</button>
-    </div>
-    <div id="modelPopover" hidden>
-      <label for="modelSelect">model</label>
-      <select id="modelSelect"></select>
-      <div id="variantWrap">
-        <label for="variantSelect">variant</label>
-        <select id="variantSelect"></select>
-      </div>
-      <div id="customFields" hidden>
-        <label for="customModelInput">custom model id</label>
-        <input id="customModelInput" type="text" autocomplete="off" spellcheck="false" placeholder="provider/model-id">
-        <label for="customVariantInput">variant (optional)</label>
-        <input id="customVariantInput" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. long">
-      </div>
     </div>
   </div>
 </div>
@@ -422,13 +459,27 @@ function renderMarkdown(text) {
 }
 
 // ---------- storage ----------
+// localStorage can throw in private browsing / when cookies are blocked;
+// fall back to an in-memory store so the app keeps working.
+const memStore = {};
+const store = {
+  get(k) {
+    try { return localStorage.getItem(k); }
+    catch (e) { return (k in memStore) ? memStore[k] : null; }
+  },
+  set(k, v) {
+    try { localStorage.setItem(k, v); }
+    catch (e) { memStore[k] = v; }
+  }
+};
+
 const SETTINGS_KEY = 'openlink-settings';
 const SESSION_KEY = 'openlink-session';
-const DEFAULT_SETTINGS = { owner: 'jonlocapo', repo: 'OpenLink', branch: 'main', token: '' };
+const DEFAULT_SETTINGS = { owner: 'jonlocapo', repo: 'OpenLink', branch: 'main', token: '', repo_spec: '', apikey: '' };
 
 function loadSettings() {
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
+    const raw = store.get(SETTINGS_KEY);
     return Object.assign({}, DEFAULT_SETTINGS, raw ? JSON.parse(raw) : {});
   } catch (e) {
     return Object.assign({}, DEFAULT_SETTINGS);
@@ -440,9 +491,12 @@ function saveSettings() {
     owner: byId('owner').value.trim(),
     repo: byId('repo').value.trim(),
     branch: byId('branch').value.trim(),
-    token: byId('token').value.trim()
+    token: byId('token').value.trim(),
+    repo_spec: byId('repoSpec').value.trim(),
+    apikey: byId('apikey').value.trim()
   };
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  store.set(SETTINGS_KEY, JSON.stringify(s));
+  updateRepoChip();
 }
 
 function newSessionId() {
@@ -453,8 +507,8 @@ function newSessionId() {
 }
 
 function sessionId() {
-  let id = localStorage.getItem(SESSION_KEY);
-  if (!id) { id = newSessionId(); localStorage.setItem(SESSION_KEY, id); }
+  let id = store.get(SESSION_KEY);
+  if (!id) { id = newSessionId(); store.set(SESSION_KEY, id); }
   return id;
 }
 
@@ -464,7 +518,8 @@ const inputEl = byId('input');
 const statusEl = byId('status');
 const statusText = byId('statusText');
 let sid = sessionId();
-let prevContent = ''; // last known transcript content
+let prevNd = '';  // last known session event stream (sessions/<sid>.ndjson)
+let prevMd = '';  // last known plain transcript (responses/<sid>.md)
 let busy = false;
 
 // ---------- UI helpers ----------
@@ -484,10 +539,12 @@ function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
 function appendUser(text) {
   const b = document.createElement('div');
   b.className = 'bubble user';
-  const via = 'via ' + (modelChoice.model || 'model');
-  const caption = modelChoice.variant ? via + ' · ' + modelChoice.variant : via;
+  const s = loadSettings();
+  const bits = ['via ' + (modelChoice.model || 'model')];
+  if (modelChoice.variant) bits.push(modelChoice.variant);
+  if (s.repo_spec) bits.push('@ ' + s.repo_spec);
   b.innerHTML = '<span class="who">you</span>' + escapeHtml(text).replace(/\n/g, '<br>') +
-               '<span class="via">' + escapeHtml(caption) + '</span>';
+               '<span class="via">' + escapeHtml(bits.join(' · ')) + '</span>';
   chatEl.appendChild(b);
   scrollBottom();
 }
@@ -555,7 +612,7 @@ function defaultModelChoice() {
 
 function loadModelChoice() {
   try {
-    const raw = localStorage.getItem(MODEL_KEY);
+    const raw = store.get(MODEL_KEY);
     if (raw) {
       const p = JSON.parse(raw);
       if (p && typeof p.model === 'string') {
@@ -567,7 +624,7 @@ function loadModelChoice() {
 }
 
 function saveModelChoice() {
-  try { localStorage.setItem(MODEL_KEY, JSON.stringify(modelChoice)); } catch (e) { /* ignore */ }
+  try { store.set(MODEL_KEY, JSON.stringify(modelChoice)); } catch (e) { /* ignore */ }
 }
 
 function chipLabel() {
@@ -675,14 +732,45 @@ variantSelect.addEventListener('change', () => {
 customModelInput.addEventListener('input', syncCustom);
 customVariantInput.addEventListener('input', syncCustom);
 
+// ---------- repo picker ----------
+const repoBtn = byId('repoBtn');
+const repoPopover = byId('repoPopover');
+const repoSpecInput = byId('repoSpecInput');
+const REPO_RE = /^[\w.-]+\/[\w.-]+(@[\w./-]+)?$/;
+
+function updateRepoChip() {
+  const spec = (loadSettings().repo_spec || '').trim();
+  repoBtn.textContent = spec ? 'repo: ' + spec : 'no repo';
+}
+
+repoBtn.addEventListener('click', () => {
+  const opening = repoPopover.hidden;
+  repoPopover.hidden = !opening;
+  if (opening) {
+    repoSpecInput.value = loadSettings().repo_spec || '';
+    repoSpecInput.classList.toggle('invalid', false);
+    repoSpecInput.focus();
+  }
+});
+
+repoSpecInput.addEventListener('input', () => {
+  const v = repoSpecInput.value.trim();
+  repoSpecInput.classList.toggle('invalid', v !== '' && !REPO_RE.test(v));
+  byId('repoSpec').value = v;
+  saveSettings();
+});
+
 document.addEventListener('click', e => {
   if (!modelPopover.hidden && !modelPopover.contains(e.target) && e.target !== modelBtn) {
     modelPopover.hidden = true;
   }
+  if (!repoPopover.hidden && !repoPopover.contains(e.target) && e.target !== repoBtn) {
+    repoPopover.hidden = true;
+  }
 });
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') modelPopover.hidden = true;
+  if (e.key === 'Escape') { modelPopover.hidden = true; repoPopover.hidden = true; }
 });
 
 // ---------- send flow ----------
@@ -707,7 +795,14 @@ async function dispatch(s, text) {
       },
       body: JSON.stringify({
         ref: s.branch,
-        inputs: { session_id: sid, message: text, model: modelChoice.model, variant: modelChoice.variant || '' }
+        inputs: {
+          session_id: sid,
+          message: text,
+          model: modelChoice.model,
+          variant: modelChoice.variant || '',
+          repo_spec: s.repo_spec || '',
+          api_key: s.apikey || ''
+        }
       })
     });
     if (res.status === 204) return true;
@@ -728,10 +823,12 @@ async function dispatch(s, text) {
 
 async function poll(s) {
   const started = Date.now();
-  const MAX_MS = 240000; // 240s max, polling every 3s
+  const MAX_MS = 360000; // 360s max, polling every 3s
   const branchPath = encodeURIComponent(s.branch).replace(/%2F/g, '/');
-  const rawUrl = () => 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
-                       encodeURIComponent(s.repo) + '/' + branchPath + '/responses/' + sid + '.md?cb=' + Date.now();
+  const base = 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
+               encodeURIComponent(s.repo) + '/' + branchPath + '/';
+  const ndUrl = () => base + 'sessions/' + sid + '.ndjson?cb=' + Date.now();
+  const mdUrl = () => base + 'responses/' + sid + '.md?cb=' + Date.now();
   showThinking();
   setStatus('thinking', 'agent thinking… (0s)');
   let lastSec = -1;
@@ -743,26 +840,37 @@ async function poll(s) {
     while (Date.now() - started < MAX_MS) {
       await sleep(3000);
       let res;
-      try { res = await fetch(rawUrl()); } catch (e) { continue; } // transient blip → keep polling
+      try { res = await fetch(ndUrl()); } catch (e) { continue; } // transient blip → keep polling
       if (res.status === 200) {
         const content = await res.text();
-        if (content.length > prevContent.length) {
-          const delta = content.slice(prevContent.length);
-          prevContent = content;
-          if (delta.trim()) {
-            hideThinking();
-            appendAssistant(renderMarkdown(delta));
-          }
-          setStatus('done', 'done');
-          return;
+        if (content.length > prevNd.length) {
+          const delta = content.slice(prevNd.length);
+          prevNd = content;
+          if (renderEventsDelta(delta)) hideThinking();
         }
+        setStatus('done', 'done');
+        appendWorkspaceLink(s);
+        return;
+      }
+      // no session event stream (yet) → fall back to the plain transcript
+      try { res = await fetch(mdUrl()); } catch (e) { continue; }
+      if (res.status === 200) {
+        const content = await res.text();
+        if (content.length > prevMd.length) {
+          const delta = content.slice(prevMd.length);
+          prevMd = content;
+          if (delta.trim()) { hideThinking(); appendAssistant(renderMarkdown(delta)); }
+        }
+        setStatus('done', 'done');
+        appendWorkspaceLink(s);
+        return;
       }
       // 404 or no new content yet → keep polling
     }
     // timeout
     hideThinking();
     const link = 'https://github.com/' + encodeURIComponent(s.owner) + '/' + encodeURIComponent(s.repo) + '/actions';
-    appendSystem(escapeHtml('Timed out after 150s — the response file was never updated. Check the workflow run: ') +
+    appendSystem(escapeHtml('Timed out after ' + Math.round(MAX_MS / 1000) + 's — nothing arrived. Check the workflow run: ') +
                  '<a href="' + link + '" target="_blank" rel="noopener">' + link + '</a>', true);
     setStatus('error', 'error');
   } catch (e) {
@@ -776,6 +884,50 @@ async function poll(s) {
   }
 }
 
+// Render new NDJSON session events (text parts grouped per messageID into
+// agent bubbles; other event types as dim activity lines).
+function renderEventsDelta(deltaText) {
+  const msgTexts = {};
+  const msgEls = {};
+  let rendered = false;
+  for (const line of deltaText.split('\n')) {
+    if (!line.trim()) continue;
+    let e;
+    try { e = JSON.parse(line); } catch (err) { continue; }
+    if (e.type === 'text' && e.part && typeof e.part.text === 'string') {
+      const id = e.messageID || 'm';
+      if (!msgEls[id]) {
+        const b = document.createElement('div');
+        b.className = 'bubble agent';
+        b.innerHTML = '<span class="who">agent</span><div class="md-body"></div>';
+        chatEl.appendChild(b);
+        msgEls[id] = b.querySelector('.md-body');
+        msgTexts[id] = '';
+      }
+      msgTexts[id] += e.part.text;
+      msgEls[id].innerHTML = renderMarkdown(msgTexts[id]);
+      rendered = true;
+    } else if (e.type && e.type !== 'part') {
+      const detail = (e.part && (e.part.tool || e.part.title)) || '';
+      const b = document.createElement('div');
+      b.className = 'bubble system dim';
+      b.textContent = '[' + e.type + (detail ? ' ' + detail : '') + ']';
+      chatEl.appendChild(b);
+      rendered = true;
+    }
+  }
+  if (rendered) scrollBottom();
+  return rendered;
+}
+
+function appendWorkspaceLink(s) {
+  if (!s.repo_spec) return;
+  const ws = 'https://github.com/' + encodeURIComponent(s.owner) + '/' + encodeURIComponent(s.repo) +
+             '/tree/workspace/' + encodeURIComponent(sid);
+  appendSystem('workspace files: <a href="' + ws + '" target="_blank" rel="noopener">' +
+               escapeHtml('workspace/' + sid) + '</a>');
+}
+
 async function send() {
   if (busy) return;
   const text = inputEl.value.trim();
@@ -783,9 +935,14 @@ async function send() {
   const s = loadSettings();
   if (!s.owner || !s.repo || !s.branch || !s.token) {
     setStatus('error', 'error');
-    appendSystem(escapeHtml('Missing settings — open Settings and fill in owner, repo, branch and token.'), true);
+    appendSystem(escapeHtml('Missing settings — open Settings and fill in relay owner, relay repo, relay branch and PAT.'), true);
     byId('settings').classList.add('open');
     byId('settingsBtn').textContent = 'Close settings';
+    return;
+  }
+  if (s.repo_spec && !REPO_RE.test(s.repo_spec)) {
+    setStatus('error', 'error');
+    appendSystem(escapeHtml('Invalid target repository "' + s.repo_spec + '" — use owner/repo or owner/repo@branch.'), true);
     return;
   }
   busy = true;
@@ -816,8 +973,9 @@ byId('newBtn').addEventListener('click', () => {
   if (busy) return;
   if (!confirm('Start a new session? The current chat will be cleared.')) return;
   sid = newSessionId();
-  localStorage.setItem(SESSION_KEY, sid);
-  prevContent = '';
+  store.set(SESSION_KEY, sid);
+  prevNd = '';
+  prevMd = '';
   chatEl.innerHTML = '';
   hideThinking();
   setStatus('idle', 'idle');
@@ -831,7 +989,7 @@ byId('settingsBtn').addEventListener('click', () => {
   byId('settingsBtn').textContent = open ? 'Close settings' : 'Settings';
 });
 
-['owner', 'repo', 'branch', 'token'].forEach(id =>
+['owner', 'repo', 'branch', 'token', 'repoSpec', 'apikey'].forEach(id =>
   byId(id).addEventListener('input', saveSettings)
 );
 
@@ -842,9 +1000,12 @@ byId('settingsBtn').addEventListener('click', () => {
   byId('repo').value = s.repo;
   byId('branch').value = s.branch;
   byId('token').value = s.token;
+  byId('repoSpec').value = s.repo_spec;
+  byId('apikey').value = s.apikey;
   byId('sessionLabel').textContent = 'session ' + sid;
   buildModelOptions();
   renderModelUi();
+  updateRepoChip();
   setBusy(false);
   setStatus('idle', 'idle');
   inputEl.focus();

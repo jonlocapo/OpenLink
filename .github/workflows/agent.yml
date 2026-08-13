@@ -1,12 +1,12 @@
-# OpenLink Agent Relay
-# Runs the opencode agent harness headlessly on a GitHub runner, so that
-# opencode API traffic originates from GitHub's infrastructure, never from
-# the client laptop. The browser only ever talks to api.github.com and
+# OpenLink Agent Relay — runs a full opencode instance headlessly on a GitHub
+# runner. opencode API traffic originates from GitHub's infrastructure, never
+# from the client laptop; the browser only talks to api.github.com and
 # raw.githubusercontent.com.
 #
-# Set the repo secret OPENCODE_API_KEY to your OpenCode Go key
-# (https://opencode.ai/auth) to go live. Without it, runs fall back to a
-# mock reply so the transport can be tested end-to-end.
+# The agent runs inside the target repo (input `repo_spec`), keeps its session
+# memory in ~/.local/share/opencode (persisted via Actions cache + --session),
+# and its workspace edits are snapshotted to the relay repo's
+# workspace/<session> branch after every turn.
 
 name: OpenLink Agent Relay
 
@@ -27,6 +27,14 @@ on:
         description: "Optional reasoning-effort variant (minimal|low|medium|high|xhigh)"
         required: false
         default: ""
+      repo_spec:
+        description: "Target repo to work on: owner/repo or owner/repo@branch (empty = relay repo itself)"
+        required: false
+        default: ""
+      api_key:
+        description: "OpenCode Go API key (prefer the OPENCODE_API_KEY repo secret; input values are visible on the public run page)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -41,20 +49,23 @@ jobs:
     timeout-minutes: 15
     env:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
       OPENCODE_DISABLE_AUTOUPDATE: "true"
       SID: ${{ github.event.inputs.session_id }}
       MSG: ${{ github.event.inputs.message }}
       MODEL: ${{ github.event.inputs.model }}
       VARIANT: ${{ github.event.inputs.variant }}
+      REPO_SPEC: ${{ github.event.inputs.repo_spec }}
+      API_KEY_INPUT: ${{ github.event.inputs.api_key }}
       SESSION_FILE: state/${{ github.event.inputs.session_id }}.session
       TRANSCRIPT: responses/${{ github.event.inputs.session_id }}.md
+      EVENTS: sessions/${{ github.event.inputs.session_id }}.ndjson
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Persist opencode's session DB (~/.local/share/opencode) between runs
-      # so the agent keeps its memory and tool state. restore-keys picks the
-      # most recent entry for this session.
+      # Persist opencode's session DB between runs so the agent keeps its
+      # memory and tool state (restore-keys picks the most recent entry).
       - name: Restore agent state
         uses: actions/cache/restore@v4
         with:
@@ -69,24 +80,50 @@ jobs:
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           "$HOME/.opencode/bin/opencode" --version
 
-      - name: Run agent (live)
-        if: env.OPENCODE_API_KEY != ''
+      - name: Prepare transcript
         run: |
-          set -euo pipefail
-          mkdir -p responses state
+          mkdir -p responses state sessions
           [ -f "$TRANSCRIPT" ] || printf '# Session %s\n' "$SID" > "$TRANSCRIPT"
           printf '\n## User\n\n%s\n\n## Agent\n\n' "$MSG" >> "$TRANSCRIPT"
 
+      - name: Clone target repo
+        if: env.REPO_SPEC != ''
+        run: |
+          set -euo pipefail
+          SPEC="$REPO_SPEC"
+          OWNER_REPO="${SPEC%@*}"
+          BR="${SPEC#*@}"; [ "$BR" = "$SPEC" ] && BR=main
+          OWNER="${OWNER_REPO%/*}"; NAME="${OWNER_REPO#*/}"
+          WORKDIR="$HOME/agent-workspace/${OWNER}--${NAME}@${BR}"
+          if ! git clone --depth 1 -b "$BR" "https://github.com/${OWNER}/${NAME}.git" "$WORKDIR" 2>/tmp/clone.err; then
+            printf '_Could not clone %s: %s. Running in the relay repo instead._\n' "$SPEC" "$(tail -n 1 /tmp/clone.err)" >> "$TRANSCRIPT"
+          else
+            # Overlay the previous workspace snapshot (agent edits from earlier turns).
+            if git clone --depth 1 -b "workspace/${SID}" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$HOME/snap" 2>/dev/null; then
+              rsync -a --delete --exclude .git "$HOME/snap/" "$WORKDIR/"
+            fi
+            echo "$WORKDIR" > /tmp/agent_workdir
+            printf '_Workspace: %s_\n' "$SPEC" >> "$TRANSCRIPT"
+          fi
+
+      - name: Run agent (live)
+        if: env.OPENCODE_API_KEY != '' || env.API_KEY_INPUT != ''
+        run: |
+          set -euo pipefail
+          if [ -n "$API_KEY_INPUT" ]; then export OPENCODE_API_KEY="$API_KEY_INPUT"; fi
           ARGS=(--model "$MODEL")
           [ -n "$VARIANT" ] && ARGS+=(--variant "$VARIANT")
           # Resume the opencode session if we have one from a previous run.
-          if [ -s "$SESSION_FILE" ]; then
-            ARGS+=(--session "$(cat "$SESSION_FILE")")
-          fi
+          if [ -s "$SESSION_FILE" ]; then ARGS+=(--session "$(cat "$SESSION_FILE")"); fi
+          # Run inside the target repo so the agent's tools see its files.
+          if [ -f /tmp/agent_workdir ]; then ARGS+=(--dir "$(cat /tmp/agent_workdir)"); fi
+          # --auto: approve tool permissions without an interactive prompt.
+          ARGS+=(--auto)
 
           opencode run "$MSG" "${ARGS[@]}" --format json > /tmp/events.ndjson
+          cat /tmp/events.ndjson >> "$EVENTS"
 
-          # Extract assistant text from the NDJSON event stream and record the
+          # Extract assistant text into the transcript and record the
           # sessionID so the next run can resume this session.
           node <<'NODE' >> "$TRANSCRIPT"
           const fs = require("fs");
@@ -106,20 +143,31 @@ jobs:
           process.stdout.write(out);
           NODE
 
-      - name: Run agent (mock — no OPENCODE_API_KEY secret)
-        if: env.OPENCODE_API_KEY == ''
+      - name: Run agent (mock — no API key configured)
+        if: env.OPENCODE_API_KEY == '' && env.API_KEY_INPUT == ''
         run: |
           set -euo pipefail
-          mkdir -p responses
-          [ -f "$TRANSCRIPT" ] || printf '# Session %s\n' "$SID" > "$TRANSCRIPT"
-          printf '\n## User\n\n%s\n\n## Agent\n\n_Mock reply — no OPENCODE_API_KEY secret configured in this repo. The relay transport works; add the secret at https://opencode.ai/auth to go live._\n' "$MSG" >> "$TRANSCRIPT"
+          printf '_Mock reply — no API key configured (add the OPENCODE_API_KEY repo secret, or paste the key in Settings). The relay transport works._\n' >> "$TRANSCRIPT"
+          printf '{"type":"text","sessionID":"mock-%s","messageID":"mock-%s-m1","part":{"type":"text","text":"_Mock reply — no API key configured. Add the OPENCODE_API_KEY repo secret or paste the key in Settings. The relay transport works._"}}\n' "$SID" "$SID" >> "$EVENTS"
 
       - name: Save agent state
-        if: env.OPENCODE_API_KEY != ''
+        if: env.OPENCODE_API_KEY != '' || env.API_KEY_INPUT != ''
         uses: actions/cache/save@v4
         with:
           path: ~/.local/share/opencode
           key: openlink-state-${{ env.SID }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Snapshot workspace
+        if: env.REPO_SPEC != ''
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/agent_workdir ]; then exit 0; fi
+          WD="$(cat /tmp/agent_workdir)"
+          git -C "$WD" add -A
+          git -C "$WD" -c user.name=openlink-agent -c user.email=openlink-agent@users.noreply.github.com \
+            commit -m "openlink session ${SID}: agent snapshot" || echo "no workspace changes"
+          git -C "$WD" push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/workspace/${SID}" --force
 
       - name: Commit transcript
         run: |

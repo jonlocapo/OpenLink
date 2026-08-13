@@ -1,6 +1,6 @@
 # OpenLink
 
-A GitHub Pages chat UI that runs the [opencode](https://opencode.ai) agent **remotely on GitHub Actions**, so that opencode API traffic originates from GitHub's infrastructure instead of the laptop's network.
+A GitHub Pages web app that runs a **full opencode agent instance** on GitHub Actions, so opencode API traffic originates from GitHub's infrastructure instead of the laptop's network.
 
 Built for a sanctioned network-filter bypass exercise: the laptop has full internet access except that the opencode API endpoints are blocked at the network level (the CLI opens but every query fails to reach the API). OpenLink routes everything through GitHub domains, which are allowed.
 
@@ -14,51 +14,56 @@ Built for a sanctioned network-filter bypass exercise: the laptop has full inter
                                     ┌────────────────┼──────────┐
                                     │  GitHub Actions runner    │
                                     │  (Azure, unfiltered)      │
-                                    │  opencode run --model ... │──▶ opencode API
+                                    │  clones target repo       │
+                                    │  opencode run --auto      │──▶ opencode API
+                                    │  snapshots workspace      │
                                     └───────────────────────────┘
 ```
 
-The laptop never calls the opencode API. The runner does, and commits the reply back to `responses/<session>.md`, which the UI polls.
+The laptop never calls the opencode API. The runner does.
+
+## What "full instance" means here
+
+- **Real opencode harness**: the agent loop, model calls, tool execution and permission handling are all opencode's own (`opencode run --auto`). OpenLink only transports prompts in and events out.
+- **Persistent agent memory**: the runner caches `~/.local/share/opencode` (session DB) between runs and resumes with `opencode run --session <id>`, so the agent keeps conversation and tool state across turns.
+- **A real workspace**: the target repo is cloned on the runner each turn, the agent reads/edits it with its tools, and the result is snapshotted to the relay repo's `workspace/<session>` branch — browseable on GitHub.
+- **Live event stream**: the runner appends the raw NDJSON event stream (`sessions/<session>.ndjson`) to the repo; the UI renders message parts and tool activity live as they land.
+- **Model + variant picker**: all 24 OpenCode Go models with reasoning-effort variants.
 
 ## What's in this repo
 
 | File | Role |
 |---|---|
-| `index.html` | The whole frontend: chat UI, model/variant picker, settings, dispatch + polling. Zero dependencies, single file. |
-| `.github/workflows/agent.yml` | The relay: installs opencode on the runner, runs the agent headlessly with your Go key, persists the agent's session DB between runs via Actions cache, commits the transcript back. |
-
-**The harness**: opencode's own CLI *is* the agent harness (model calls, tool execution, permissions, session memory). OpenLink does not reimplement any of that — it only transports the prompt in and the transcript out. Session memory is preserved across runs by caching `~/.local/share/opencode` and resuming with `opencode run --session <id>`.
+| `index.html` | The whole frontend: chat UI, model/variant picker, target-repo picker, settings (PAT + API key), dispatch + polling. Zero dependencies, single file. |
+| `.github/workflows/agent.yml` | The relay: installs opencode, restores session state, clones the target repo, runs the agent headlessly, appends the event stream, snapshots the workspace, commits the transcript. |
 
 ## Setup
 
-1. **Push this repo to GitHub** and add your OpenCode Go key as a repo secret:
+1. **Push this repo to GitHub** and (recommended) add your OpenCode Go key as a repo secret:
    - Get a key at <https://opencode.ai/auth> (OpenCode Go plan).
-   - Repo → Settings → Secrets and variables → Actions → New repository secret:
-     - Name: `OPENCODE_API_KEY`
-     - Value: your key
-   - Without the secret the relay still works in **mock mode** (test the transport first).
-2. **Enable Pages**: Settings → Pages → Source: "Deploy from a branch" → branch `main`, folder `/` → Save. Site appears at `https://<owner>.github.io/OpenLink/` (public Pages is required for free unlimited Actions minutes).
+   - Repo → Settings → Secrets and variables → Actions → New repository secret: name `OPENCODE_API_KEY`, value = your key.
+   - Alternatively paste the key in the UI's Settings — but a key sent as a workflow input is **visible on the public Actions run page**, so prefer the secret unless the repo is private.
+   - Without a key the relay runs in **mock mode** (test the transport first).
+2. **Enable Pages**: Settings → Pages → Source: "Deploy from a branch" → branch `main`, folder `/` → Save. Site appears at `https://<owner>.github.io/OpenLink/` (public Pages = free unlimited Actions minutes).
 3. **Create a GitHub token for the UI** at <https://github.com/settings/personal-access-tokens>:
-   - Fine-grained: repository access → this repo → `Actions → Workflows: read and write` (fine-grained PATs require you to be a repo member/collaborator).
+   - Fine-grained: repository access → this repo → `Actions → Workflows: read and write`.
    - Or classic: `workflow` scope.
-4. Open the Pages URL, click **Settings**, paste the token, pick a **model + variant** (all 24 OpenCode Go models are listed), and chat. The token stays in your browser's localStorage and is only sent to `api.github.com`.
+4. Open the Pages URL → **Settings** → paste the PAT. Optionally set the **target repository** (`owner/repo` or `owner/repo@branch`, public repos; empty = work inside the relay repo) via the repo chip or Settings. Pick a **model + variant**, then chat.
 
-## Model picker
+## How a turn works
 
-All OpenCode Go models from `models.dev` are listed: `gpt-5.6-luna`, `deepseek-v4-pro`, `deepseek-v4-flash`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `kimi-k2.5`, `grok-4.5`, `qwen3.8-max`, `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus`, `qwen3.5-plus`, `glm-5.2`, `glm-5.1`, `glm-5`, `minimax-m3`, `minimax-m2.7`, `minimax-m2.5`, `mimo-v2.5-pro`, `mimo-v2.5`, `mimo-v2-pro`, `mimo-v2-omni`, `hy3`.
-
-Variants use opencode's `--variant` flag with OpenAI-style reasoning effort (`minimal`/`low`/`medium`/`high`/`xhigh`); leave on `default` for models that don't expose effort control.
-
-## How it works
-
-1. **Send**: the UI POSTs to `POST /repos/{owner}/{repo}/actions/workflows/agent.yml/dispatches` with inputs `{session_id, message, model, variant}` (65,535-char input limit — far above chat needs).
-2. **Run**: a runner checks out the repo, restores the cached opencode session DB for this session, runs `opencode run <message> --model <model> [--variant v] [--session id] --format json` with `OPENCODE_API_KEY` from the secret, filters the `text` events, and appends them to `responses/<session>.md`; the session DB is re-cached and the transcript committed (GITHUB_TOKEN pushes don't retrigger workflows or Pages builds).
-3. **Receive**: the UI polls `https://raw.githubusercontent.com/{owner}/{repo}/{branch}/responses/{session}.md` every 3s and renders only the new delta.
+1. **Send**: the UI POSTs `POST /repos/{owner}/{repo}/actions/workflows/agent.yml/dispatches` with inputs `{session_id, message, model, variant, repo_spec, api_key}`.
+2. **Run**: a runner restores the cached opencode session DB, clones the target repo (overlaying the previous `workspace/<session>` snapshot so the agent's earlier edits are present), then runs `opencode run <message> --model <model> [--variant v] [--session id] --dir <workspace> --auto --format json` with the Go key from the secret (or the input).
+3. **Persist**: the NDJSON event stream is appended to `sessions/<session>.ndjson`, the session DB is re-cached, the workspace is committed to the `workspace/<session>` branch, and the plain transcript is appended to `responses/<session>.md`.
+4. **Receive**: the UI polls the NDJSON (fallback: the `.md` transcript) every 3s and renders only new events: assistant text per message, plus dim `[tool]` activity lines.
 
 ## Notes & limits
 
-- **Scope**: use this within the bounds of your competition/engagement. Don't push sensitive data through it — transcripts are committed to the repo (visible publicly if the repo is public).
-- **Costs**: public repos get free Actions minutes; each message is one workflow run (~1 min). Cache is capped by GitHub (10 GB/repo); old session entries get evicted.
-- **Errors**: if the agent run fails, no transcript update lands and the UI times out — check the Actions tab for logs.
-- **Rate limits**: authenticated API calls are 5,000/hr — polling at one request per 3s is fine. Avoid spamming dispatches (content-creation bucket: 500/hr).
+- **Scope**: use this within the bounds of your competition/engagement. Don't push sensitive data through it — transcripts and event streams are committed to the repo (visible publicly if the repo is public). The API-key input is likewise visible on the run page.
+- **Workspace edits** are snapshotted to the relay repo, not pushed back to the target repo (that would need a PAT with write access to it — possible extension).
+- **Switching target repos mid-session**: opencode sessions are scoped to a project directory; start a new session when you change `owner/repo@branch`.
+- **Costs**: public repos get free Actions minutes; each turn is one workflow run (~1 min, longer when the agent uses tools). Run timeouts: 15 min per turn; the UI polls up to 6 min.
+- **Errors**: if the agent run fails, nothing lands and the UI times out — check the Actions tab for logs.
+- **Rate limits**: authenticated API calls are 5,000/hr; polling once per 3s is fine; avoid spamming dispatches (content-creation bucket: 500/hr).
 - **GitHub ToS**: Actions is meant for software development; a personal agent relay is off-label usage. Keep volume modest.
+- **Full TUI parity** (the terminal UI itself) can't run on a static Pages site — runners can't accept inbound connections. The GitHub-native alternative is Codespaces (opencode in a cloud terminal on GitHub domains).
