@@ -1,0 +1,1 @@
+{"type":"text","sessionID":"mock-s-test04","messageID":"mock-s-test04-m1","part":{"type":"text","text":"_Mock reply — no API key configured. Add the OPENCODE_API_KEY repo secret or paste the key in Settings. The relay transport works._"}}
