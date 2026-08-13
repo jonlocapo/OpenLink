@@ -950,7 +950,7 @@ function fail(msg) {
 
 async function dispatch(s, text) {
   const url = 'https://api.github.com/repos/' + encodeURIComponent(s.owner) + '/' +
-              encodeURIComponent(s.repo) + '/actions/workflows/agent.yml/dispatches';
+              encodeURIComponent(s.repo) + '/actions/workflows/relay.yml/dispatches';
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -979,7 +979,7 @@ async function dispatch(s, text) {
     } else if (res.status === 403) {
       fail('Permission denied — the PAT needs the "workflow" scope (classic) or "Actions → Workflows: read and write" (fine-grained).');
     } else if (res.status === 404) {
-      fail('Workflow not found — check that owner/repo are correct and agent.yml exists on branch "' + s.branch + '".');
+      fail('Workflow not found — check that owner/repo are correct and relay.yml exists on branch "' + s.branch + '".');
     } else {
       fail('Dispatch failed — HTTP ' + res.status + '.');
     }
