@@ -14,7 +14,7 @@ try {
 
 let n = 0;
 for (const name of manifest.chunks || []) {
-  if (!/^chunk\.\d{3}\.json$/.test(String(name))) continue;
+  if (!/^chunk\.[0-9a-f]{16}\.json$/.test(String(name))) continue;
   let data;
   try {
     data = JSON.parse(fs.readFileSync(path.join(srcDir, name), 'utf8'));
