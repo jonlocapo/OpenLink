@@ -67,7 +67,7 @@ jobs:
         run: |
           curl -fsSL https://opencode.ai/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          opencode --version
+          "$HOME/.opencode/bin/opencode" --version
 
       - name: Run agent (live)
         if: env.OPENCODE_API_KEY != ''
