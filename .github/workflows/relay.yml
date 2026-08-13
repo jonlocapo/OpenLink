@@ -92,7 +92,7 @@ jobs:
       - name: Prepare transcript
         run: |
           mkdir -p responses state sessions
-          [ -f "$TRANSCRIPT" ] || printf '# Session %s\n' "$SID" > "$TRANSCRIPT"
+          if [ ! -f "$TRANSCRIPT" ]; then printf '# Session %s\n' "$SID" > "$TRANSCRIPT"; fi
           printf '\n## User\n\n%s\n\n## Agent\n\n' "$MSG" >> "$TRANSCRIPT"
 
       - name: Prepare workspace
@@ -104,21 +104,7 @@ jobs:
             mkdir -p "$WD"
             SRC="uploads/$WORKSPACE_UPLOAD/workspace.json"
             if [ -f "$SRC" ]; then
-              COUNT=$(SRC="$SRC" DST="$WD" node <<'NODE'
-              const fs = require("fs"), path = require("path");
-              const data = JSON.parse(fs.readFileSync(process.env.SRC, "utf8"));
-              let n = 0;
-              for (const f of (data.files || [])) {
-                const rel = String(f.path || "").replace(/\\/g, "/");
-                if (!rel || rel.startsWith("/") || rel.split("/").includes("..")) continue;
-                const p = path.join(process.env.DST, rel);
-                fs.mkdirSync(path.dirname(p), { recursive: true });
-                fs.writeFileSync(p, Buffer.from(f.content || "", "base64"));
-                n++;
-              }
-              console.log(n);
-NODE
-)
+              COUNT=$(SRC="$SRC" DST="$WD" node scripts/unpack-workspace.js)
               printf '_Workspace: linked folder (%s files)_\n' "$COUNT" >> "$TRANSCRIPT"
             else
               printf '_Workspace upload missing (%s) — empty workspace._\n' "$SRC" >> "$TRANSCRIPT"
@@ -158,26 +144,7 @@ NODE
 
           opencode run "$MSG" "${ARGS[@]}" --format json > /tmp/events.ndjson
           cat /tmp/events.ndjson >> "$EVENTS"
-
-          # Extract assistant text into the transcript and record the
-          # sessionID so the next run can resume this session.
-          node <<'NODE' >> "$TRANSCRIPT"
-          const fs = require("fs");
-          let sessionID = "";
-          let out = "";
-          for (const line of fs.readFileSync("/tmp/events.ndjson", "utf8").split("\n")) {
-            if (!line) continue;
-            try {
-              const e = JSON.parse(line);
-              if (e.sessionID && !sessionID) sessionID = e.sessionID;
-              if (e.type === "text" && e.part && e.part.text) out += e.part.text;
-            } catch {}
-          }
-          if (sessionID && !fs.existsSync(process.env.SESSION_FILE)) {
-            fs.writeFileSync(process.env.SESSION_FILE, sessionID);
-          }
-          process.stdout.write(out);
-          NODE
+          EVENTS_FILE=/tmp/events.ndjson SESSION_FILE="$SESSION_FILE" node scripts/extract-transcript.js >> "$TRANSCRIPT"
 
       - name: Run agent (mock — no API key configured)
         if: env.OPENCODE_API_KEY == '' && env.API_KEY_INPUT == ''
@@ -204,22 +171,7 @@ NODE
           WD="$(cat /tmp/agent_workdir)"
           if [ -n "$WORKSPACE_UPLOAD" ]; then
             mkdir -p "uploads/$WORKSPACE_UPLOAD"
-            ROOT="$WD" OUT="uploads/$WORKSPACE_UPLOAD/workspace.json" node <<'NODE'
-            const fs = require("fs"), path = require("path");
-            const IGNORE = new Set([".git"]);
-            const files = [];
-            (function walk(dir, rel) {
-              for (const name of fs.readdirSync(dir)) {
-                if (IGNORE.has(name)) continue;
-                const p = path.join(dir, name);
-                const r = rel ? rel + "/" + name : name;
-                const st = fs.statSync(p);
-                if (st.isDirectory()) walk(p, r);
-                else files.push({ path: r, content: fs.readFileSync(p).toString("base64") });
-              }
-            })(process.env.ROOT, "");
-            fs.writeFileSync(process.env.OUT, JSON.stringify({ files }));
-NODE
+            ROOT="$WD" OUT="uploads/$WORKSPACE_UPLOAD/workspace.json" node scripts/repack-workspace.js
           else
             git -C "$WD" add -A
             git -C "$WD" -c user.name=openlink-agent -c user.email=openlink-agent@users.noreply.github.com \
@@ -235,5 +187,3 @@ NODE
           git add -A
           git commit -m "openlink: session ${SID} update" || echo "nothing to commit"
           git push
-
-# (noop: force workflow re-registration)
