@@ -30,7 +30,9 @@ The laptop never calls the opencode API. The runner does.
   - **Linked local folder** (Chrome/Edge/Firefox): pick a folder on the laptop; it's packed, uploaded before each turn, the agent works on it on the runner, and the changed files are written **back into the local folder** when the turn completes. No repo needed.
   - **GitHub repo**: set `owner/repo[@branch]`; it's cloned on the runner, the agent edits it, and the result is snapshotted to the relay repo's `workspace/<session>` branch — browseable on GitHub.
 - **Live event stream**: the runner appends the raw NDJSON event stream (`sessions/<session>.ndjson`) to the repo; the UI renders message parts and tool activity live as they land.
-- **Model + variant picker**: all 24 OpenCode Go models with reasoning-effort variants.
+- **Message queue**: type while a turn is running — messages queue (a `queue: N` chip shows the count) and send automatically when the previous turn finishes.
+- **Turn notifications**: opt-in browser notification when a turn finishes or fails (Settings → "notify when a turn finishes"; permission is requested on enable).
+- **Model + variant picker**: all 24 OpenCode Go models, each with its real effort levels from models.dev (e.g. `gpt-5.6-luna`: none/low/medium/high/xhigh/max, `deepseek-v4-flash`: low/high/max; toggle-style models offer `default` only).
 
 ## What's in this repo
 

@@ -242,6 +242,23 @@ button:disabled{opacity:.45;cursor:not-allowed}
   white-space:nowrap;
 }
 .model-chip:hover{border-color:var(--accent)}
+.queue-label{
+  background:var(--bg2);
+  color:var(--accent);
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:4px 10px;
+  font-size:11px;
+}
+#settings .checkrow{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  margin:12px 0 0;
+  color:var(--fg);
+  cursor:pointer;
+}
+#settings input[type="checkbox"]{width:auto;accent-color:var(--accent)}
 #modelPopover,
 #repoPopover,
 #folderPopover{
@@ -353,6 +370,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
     <input id="repoSpec" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. jonlocapo/OpenLink@main">
     <label for="apikey">OpenCode Go API key (optional)</label>
     <input id="apikey" type="password" autocomplete="off" spellcheck="false">
+    <label class="checkrow" for="notify"><input id="notify" type="checkbox"> notify when a turn finishes</label>
     <p class="hint">Create the PAT at <a href="https://github.com/settings/personal-access-tokens" target="_blank" rel="noopener">github.com/settings/personal-access-tokens</a>.
     Fine-grained PAT: grant this repository <strong>Actions → Workflows: read and write</strong> and <strong>Contents → Read and write</strong>.
     Classic PAT: tick the <strong>workflow</strong> and <strong>repo</strong> scopes.
@@ -368,6 +386,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
       <button id="folderBtn" class="model-chip" type="button" title="Link a local folder"></button>
       <button id="repoBtn" class="model-chip" type="button" title="Choose target repository"></button>
       <button id="modelBtn" class="model-chip" type="button" title="Choose model and variant"></button>
+      <span id="queueLabel" class="queue-label" hidden></span>
       <div id="folderPopover" hidden>
         <p class="pop-hint">Link a folder on this laptop: its contents are uploaded to the relay repo, the agent works on them on the runner, and the changed files are written back into your folder — with Chrome, Edge or <strong>Firefox 135+</strong> (not in private browsing), which expose the File System Access API. Other browsers get <strong>upload-only mode</strong>: pick the folder to upload, and after each turn download the updated <code>workspace.json</code>. Skips <code>.git</code>, <code>node_modules</code>, <code>dist</code>, <code>build</code> and similar.</p>
         <button id="linkFolderBtn" type="button">Link folder…</button>
@@ -407,38 +426,59 @@ button:disabled{opacity:.45;cursor:not-allowed}
 // ---------- model registry ----------
 // The ONLY place model data lives. Swap these entries freely; the picker,
 // chip label, dispatch payload and chat captions all derive from here.
-// Generic reasoning-effort variants accepted by opencode's --variant flag
-// (OpenAI-style effort levels; leave on "default" for models without effort control).
-const EFFORT_VARIANTS = [
-  { id: "", label: "default" }, { id: "minimal", label: "minimal" },
-  { id: "low", label: "low" }, { id: "medium", label: "medium" },
-  { id: "high", label: "high" }, { id: "xhigh", label: "xhigh" }
-];
+// Per-model variant lists from models.dev (opencode-go provider):
+// effort-type reasoning options map 1:1 to opencode --variant values;
+// toggle/budget-token models expose no variant ids, so they offer "default"
+// only (the Custom model… option can still pass anything).
 const MODELS = [
-  { id: "opencode-go/gpt-5.6-luna", label: "GPT-5.6 Luna (2x usage)", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/deepseek-v4-pro", label: "DeepSeek V4 Pro", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/deepseek-v4-flash", label: "DeepSeek V4 Flash (2x usage)", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/kimi-k3", label: "Kimi K3", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/kimi-k2.7-code", label: "Kimi K2.7 Code", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/kimi-k2.6", label: "Kimi K2.6", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/kimi-k2.5", label: "Kimi K2.5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/grok-4.5", label: "Grok 4.5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/qwen3.8-max", label: "Qwen3.8 Max", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/qwen3.7-max", label: "Qwen3.7 Max", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/qwen3.7-plus", label: "Qwen3.7 Plus", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/qwen3.6-plus", label: "Qwen3.6 Plus", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/qwen3.5-plus", label: "Qwen3.5 Plus", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/glm-5.2", label: "GLM-5.2", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/glm-5.1", label: "GLM-5.1", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/glm-5", label: "GLM-5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/minimax-m3", label: "MiniMax-M3", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/minimax-m2.7", label: "MiniMax-M2.7", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/minimax-m2.5", label: "MiniMax-M2.5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/mimo-v2.5-pro", label: "MiMo V2.5 Pro", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/mimo-v2.5", label: "MiMo V2.5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/mimo-v2-pro", label: "MiMo V2 Pro", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/mimo-v2-omni", label: "MiMo V2 Omni", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
-  { id: "opencode-go/hy3", label: "Hy3", provider: "OpenCode Go", variants: EFFORT_VARIANTS }
+  { id: "opencode-go/gpt-5.6-luna", label: "GPT-5.6 Luna (2x usage)", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"},{"id":"none","label":"none"},{"id":"low","label":"low"},{"id":"medium","label":"medium"},{"id":"high","label":"high"},{"id":"xhigh","label":"xhigh"},{"id":"max","label":"max"}] },
+  { id: "opencode-go/deepseek-v4-pro", label: "DeepSeek V4 Pro (New)", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"},{"id":"high","label":"high"},{"id":"max","label":"max"}] },
+  { id: "opencode-go/deepseek-v4-flash", label: "DeepSeek V4 Flash (2x usage)", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"},{"id":"low","label":"low"},{"id":"high","label":"high"},{"id":"max","label":"max"}] },
+  { id: "opencode-go/kimi-k3", label: "Kimi K3", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"},{"id":"max","label":"max"}] },
+  { id: "opencode-go/kimi-k2.7-code", label: "Kimi K2.7 Code", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/kimi-k2.6", label: "Kimi K2.6", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/kimi-k2.5", label: "Kimi K2.5", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/grok-4.5", label: "Grok 4.5", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"},{"id":"low","label":"low"},{"id":"medium","label":"medium"},{"id":"high","label":"high"}] },
+  { id: "opencode-go/qwen3.8-max", label: "Qwen3.8 Max", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/qwen3.7-max", label: "Qwen3.7 Max", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/qwen3.7-plus", label: "Qwen3.7 Plus", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/qwen3.6-plus", label: "Qwen3.6 Plus", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/qwen3.5-plus", label: "Qwen3.5 Plus", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/glm-5.2", label: "GLM-5.2", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"},{"id":"high","label":"high"},{"id":"max","label":"max"}] },
+  { id: "opencode-go/glm-5.1", label: "GLM-5.1", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/glm-5", label: "GLM-5", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/minimax-m3", label: "MiniMax-M3", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/minimax-m2.7", label: "MiniMax-M2.7", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/minimax-m2.5", label: "MiniMax-M2.5", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/mimo-v2.5-pro", label: "MiMo V2.5 Pro", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/mimo-v2.5", label: "MiMo V2.5", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/mimo-v2-pro", label: "MiMo V2 Pro", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/mimo-v2-omni", label: "MiMo V2 Omni", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"}] },
+  { id: "opencode-go/hy3", label: "Hy3", provider: "OpenCode Go",
+    variants: [{"id":"","label":"default"},{"id":"none","label":"none"},{"id":"low","label":"low"},{"id":"high","label":"high"}] },
 ];
 
 // ---------- helpers ----------
@@ -491,7 +531,7 @@ const store = {
 
 const SETTINGS_KEY = 'openlink-settings';
 const SESSION_KEY = 'openlink-session';
-const DEFAULT_SETTINGS = { owner: 'jonlocapo', repo: 'OpenLink', branch: 'main', token: '', repo_spec: '', apikey: '' };
+const DEFAULT_SETTINGS = { owner: 'jonlocapo', repo: 'OpenLink', branch: 'main', token: '', repo_spec: '', apikey: '', notify: false };
 
 function loadSettings() {
   try {
@@ -509,7 +549,8 @@ function saveSettings() {
     branch: byId('branch').value.trim(),
     token: byId('token').value.trim(),
     repo_spec: byId('repoSpec').value.trim(),
-    apikey: byId('apikey').value.trim()
+    apikey: byId('apikey').value.trim(),
+    notify: byId('notify').checked
   };
   store.set(SETTINGS_KEY, JSON.stringify(s));
   updateRepoChip();
@@ -545,18 +586,20 @@ function setStatus(state, text) {
 }
 
 function setBusy(b) {
-  inputEl.disabled = b;
-  byId('sendBtn').disabled = b || !inputEl.value.trim();
+  // The input stays enabled while a turn runs so messages can be queued.
+  byId('sendBtn').disabled = !inputEl.value.trim();
   byId('newBtn').disabled = b;
 }
 
 function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
 
-function appendUser(text) {
+function appendUser(text, queued) {
   const b = document.createElement('div');
   b.className = 'bubble user';
   const s = loadSettings();
-  const bits = ['via ' + (modelChoice.model || 'model')];
+  const bits = [];
+  if (queued) bits.push('queued');
+  bits.push('via ' + (modelChoice.model || 'model'));
   if (modelChoice.variant) bits.push(modelChoice.variant);
   if (folderHandle) bits.push('@ folder: ' + folderName);
   if (folderUploadOnly) bits.push('@ folder (upload): ' + folderName);
@@ -1193,6 +1236,7 @@ async function poll(s) {
         const st = await checkRunStatus(s, started);
         if (st.startsWith('failed:')) {
           hideThinking();
+          notifyUser('OpenLink — turn failed', 'The workflow run failed.');
           appendSystem(escapeHtml('The workflow run failed: ') + '<a href="' + escapeHtml(st.slice(7)) +
                        '" target="_blank" rel="noopener">' + escapeHtml(st.slice(7)) + '</a>', true);
           setStatus('error', 'error');
@@ -1219,6 +1263,7 @@ async function poll(s) {
             if (m.status === 200) prevMd = await m.text();
           } catch (e) { /* ignore */ }
           setStatus('done', 'done');
+          notifyUser('OpenLink — reply ready', eventText(delta));
           appendWorkspaceLink(s);
           await syncWorkspace(s);
           return;
@@ -1239,6 +1284,7 @@ async function poll(s) {
             if (n.status === 200) prevNd = await n.text();
           } catch (e) { /* ignore */ }
           setStatus('done', 'done');
+          notifyUser('OpenLink — reply ready', delta);
           appendWorkspaceLink(s);
           await syncWorkspace(s);
           return;
@@ -1249,12 +1295,14 @@ async function poll(s) {
     }
     // timeout
     hideThinking();
+    notifyUser('OpenLink — turn failed', 'Timed out — nothing arrived in ' + Math.round(MAX_MS / 1000) + 's.');
     const link = 'https://github.com/' + encodeURIComponent(s.owner) + '/' + encodeURIComponent(s.repo) + '/actions';
     appendSystem(escapeHtml('Timed out after ' + Math.round(MAX_MS / 1000) + 's — nothing arrived. Check the workflow run: ') +
                  '<a href="' + link + '" target="_blank" rel="noopener">' + link + '</a>', true);
     setStatus('error', 'error');
   } catch (e) {
     hideThinking();
+    notifyUser('OpenLink — turn failed', 'Polling error: ' + e.message);
     appendSystem(escapeHtml('Polling error: ' + e.message), true);
     setStatus('error', 'error');
   } finally {
@@ -1373,10 +1421,38 @@ async function syncWorkspace(s) {
   }
 }
 
+// ---------- queue ----------
+const queue = [];
+
+function updateQueueLabel() {
+  const el = byId('queueLabel');
+  el.hidden = queue.length === 0;
+  el.textContent = queue.length ? 'queue: ' + queue.length : '';
+}
+
 async function send() {
-  if (busy) return;
   const text = inputEl.value.trim();
   if (!text) return;
+  inputEl.value = '';
+  if (busy) {
+    // A turn is in flight — queue the message and send it when it finishes.
+    queue.push(text);
+    appendUser(text, true);
+    updateQueueLabel();
+    return;
+  }
+  await sendText(text);
+}
+
+async function drainQueue() {
+  while (queue.length && !busy) {
+    const next = queue.shift();
+    updateQueueLabel();
+    await sendText(next);
+  }
+}
+
+async function sendText(text) {
   const s = loadSettings();
   if (!s.owner || !s.repo || !s.branch || !s.token) {
     setStatus('error', 'error');
@@ -1391,7 +1467,6 @@ async function send() {
     return;
   }
   busy = true;
-  inputEl.value = '';
   setBusy(true);
   appendUser(text);
   setStatus('dispatching', 'dispatching…');
@@ -1425,6 +1500,30 @@ async function send() {
   const ok = await dispatch(s, text);
   if (!ok) return;
   await poll(s);
+  await drainQueue();
+}
+
+// Extract the assistant text from an NDJSON delta (for notifications).
+function eventText(deltaText) {
+  let out = '';
+  for (const line of deltaText.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line);
+      if (e.type === 'text' && e.part && typeof e.part.text === 'string') out += e.part.text;
+    } catch (err) { /* ignore */ }
+  }
+  return out.trim();
+}
+
+function notifyUser(title, body) {
+  try {
+    if (loadSettings().notify &&
+        typeof Notification !== 'undefined' &&
+        Notification.permission === 'granted') {
+      new Notification(title, { body: String(body || '').slice(0, 200), tag: 'openlink' });
+    }
+  } catch (e) { /* ignore */ }
 }
 
 // Restore the conversation + baselines on page load so reloads keep history
@@ -1458,12 +1557,12 @@ async function primeHistory() {
 inputEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
-    if (!busy && inputEl.value.trim()) send();
+    if (inputEl.value.trim()) send();
   }
 });
 
 inputEl.addEventListener('input', () => {
-  byId('sendBtn').disabled = busy || !inputEl.value.trim();
+  byId('sendBtn').disabled = !inputEl.value.trim();
 });
 
 byId('sendBtn').addEventListener('click', send);
@@ -1475,6 +1574,8 @@ byId('newBtn').addEventListener('click', () => {
   store.set(SESSION_KEY, sid);
   prevNd = '';
   prevMd = '';
+  queue.length = 0;
+  updateQueueLabel();
   chatEl.innerHTML = '';
   hideThinking();
   setStatus('idle', 'idle');
@@ -1492,6 +1593,13 @@ byId('settingsBtn').addEventListener('click', () => {
   byId(id).addEventListener('input', saveSettings)
 );
 
+byId('notify').addEventListener('change', () => {
+  saveSettings();
+  if (byId('notify').checked && typeof Notification !== 'undefined' && Notification.permission !== 'granted') {
+    try { Notification.requestPermission(); } catch (e) { /* ignore */ }
+  }
+});
+
 // ---------- init ----------
 (function init() {
   const s = loadSettings();
@@ -1501,6 +1609,7 @@ byId('settingsBtn').addEventListener('click', () => {
   byId('token').value = s.token;
   byId('repoSpec').value = s.repo_spec;
   byId('apikey').value = s.apikey;
+  byId('notify').checked = !!s.notify;
   byId('sessionLabel').textContent = 'session ' + sid;
   buildModelOptions();
   renderModelUi();
