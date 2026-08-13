@@ -1474,10 +1474,23 @@ async function checkRunStatus(s) {
   return run.status;
 }
 
+function fmtTokens(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return Math.round(n / 1000) + 'K';
+  return String(n);
+}
+function fmtCost(c) {
+  if (!c) return '';
+  if (c >= 0.01) return '$' + c.toFixed(2);
+  if (c >= 0.0001) return '$' + c.toFixed(4);
+  return '<$0.0001';
+}
+
 // Render new NDJSON session events, dispatched by part.type:
 //   - text parts   → agent bubbles (grouped per messageID)
 //   - reasoning    → dim collapsible "thinking" blocks
-//   - tool parts   → `[tool] <name>` activity lines
+//   - tool parts   → `[tool] <name> · <title>` activity lines
+//   - step_finish  → `[step] <reason> · <tokens> · <cost>` activity lines
 //   - error events → red error bubbles with the message
 // Returns {rendered, hadError, preview}.
 function renderEventsDelta(deltaText) {
@@ -1486,6 +1499,13 @@ function renderEventsDelta(deltaText) {
   let rendered = false;
   let hadError = false;
   let preview = '';
+  const addDim = (text) => {
+    const b = document.createElement('div');
+    b.className = 'bubble system dim';
+    b.textContent = text;
+    chatEl.appendChild(b);
+    rendered = true;
+  };
   for (const line of deltaText.split('\n')) {
     if (!line.trim()) continue;
     let e;
@@ -1509,13 +1529,19 @@ function renderEventsDelta(deltaText) {
       rendered = true;
       continue;
     }
+    if (e.type === 'step_finish') {
+      const toks = part.tokens && part.tokens.total;
+      const bits = ['[step] ' + (part.reason || 'done')];
+      if (toks) bits.push(fmtTokens(toks) + ' tokens');
+      if (typeof part.cost === 'number') bits.push(fmtCost(part.cost));
+      addDim(bits.join(' · '));
+      continue;
+    }
     if (part.type === 'tool' || e.type === 'tool') {
       const name = part.tool || part.title || 'tool';
-      const b = document.createElement('div');
-      b.className = 'bubble system dim';
-      b.textContent = '[tool] ' + name;
-      chatEl.appendChild(b);
-      rendered = true;
+      const bits = ['[tool] ' + name];
+      if (part.title && part.title !== name) bits.push(part.title);
+      addDim(bits.join(' · '));
       continue;
     }
     if (e.type === 'text' && typeof part.text === 'string') {
@@ -1535,11 +1561,7 @@ function renderEventsDelta(deltaText) {
       continue;
     }
     if (typeof part.text === 'string') {
-      const b = document.createElement('div');
-      b.className = 'bubble system dim';
-      b.textContent = String(part.text).slice(0, 200);
-      chatEl.appendChild(b);
-      rendered = true;
+      addDim(String(part.text).slice(0, 200));
     }
   }
   if (rendered) scrollBottom();
