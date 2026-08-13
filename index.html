@@ -369,7 +369,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
       <button id="repoBtn" class="model-chip" type="button" title="Choose target repository"></button>
       <button id="modelBtn" class="model-chip" type="button" title="Choose model and variant"></button>
       <div id="folderPopover" hidden>
-        <p class="pop-hint">Link a folder on this laptop: its contents are packed and uploaded to the relay repo each turn, the agent works on them on the runner, and the changed files are written back into your folder. Requires Chrome, Edge or Firefox (File System Access API). Skips <code>.git</code>, <code>node_modules</code>, <code>dist</code>, <code>build</code> and similar.</p>
+        <p class="pop-hint">Link a folder on this laptop: its contents are uploaded to the relay repo, the agent works on them on the runner, and the changed files are written back into your folder — with Chrome, Edge or <strong>Firefox 135+</strong> (not in private browsing), which expose the File System Access API. Other browsers get <strong>upload-only mode</strong>: pick the folder to upload, and after each turn download the updated <code>workspace.json</code>. Skips <code>.git</code>, <code>node_modules</code>, <code>dist</code>, <code>build</code> and similar.</p>
         <button id="linkFolderBtn" type="button">Link folder…</button>
         <button id="unlinkFolderBtn" type="button" hidden>Unlink folder</button>
         <p class="pop-hint" id="folderState"></p>
@@ -559,6 +559,7 @@ function appendUser(text) {
   const bits = ['via ' + (modelChoice.model || 'model')];
   if (modelChoice.variant) bits.push(modelChoice.variant);
   if (folderHandle) bits.push('@ folder: ' + folderName);
+  if (folderUploadOnly) bits.push('@ folder (upload): ' + folderName);
   if (s.repo_spec) bits.push('@ ' + s.repo_spec);
   b.innerHTML = '<span class="who">you</span>' + escapeHtml(text).replace(/\n/g, '<br>') +
                '<span class="via">' + escapeHtml(bits.join(' · ')) + '</span>';
@@ -806,7 +807,8 @@ const FS_SUPPORTED = typeof window.showDirectoryPicker === 'function';
 const FOLDER_IGNORE = new Set(['.git', 'node_modules', '.DS_Store', 'dist', 'build', '__pycache__', '.venv', 'venv', 'target']);
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 20 * 1024 * 1024;
-let folderHandle = null;   // FileSystemDirectoryHandle
+let folderHandle = null;   // FileSystemDirectoryHandle (write-back mode)
+let folderUploadOnly = false; // true = upload-only fallback (no FS Access API)
 let folderFiles = [];      // [{path, content(base64)}] last packed snapshot
 let folderName = '';
 
@@ -875,35 +877,83 @@ async function applyPayloadToFolder(handle, files) {
 }
 
 function updateFolderChip() {
-  folderBtn.textContent = folderHandle ? 'folder: ' + folderName : 'no folder';
+  if (folderHandle) folderBtn.textContent = 'folder: ' + folderName;
+  else if (folderUploadOnly) folderBtn.textContent = 'folder (upload): ' + folderName;
+  else folderBtn.textContent = 'no folder';
 }
 
 folderBtn.addEventListener('click', () => {
   const opening = folderPopover.hidden;
   folderPopover.hidden = !opening;
   if (opening && !FS_SUPPORTED) {
-    folderState.textContent = 'Not supported in this browser — use Chrome, Edge or Firefox.';
+    folderState.textContent = 'Write-back needs Firefox 135+ (not private browsing), Chrome or Edge. You can still pick a folder to upload — upload-only mode.';
   }
 });
 
+// Upload-only fallback: pick a folder with the old webkitdirectory picker.
+// No handle is kept, so changes can't be written back to disk — the updated
+// workspace is offered as a download after each turn instead.
+function pickFolderFallback() {
+  return new Promise((resolve) => {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.setAttribute('webkitdirectory', '');
+    inp.style.display = 'none';
+    document.body.appendChild(inp);
+    inp.onchange = async () => {
+      const picked = Array.from(inp.files || []);
+      inp.remove();
+      if (!picked.length) return resolve(null);
+      const files = [];
+      const warnings = [];
+      let total = 0;
+      for (const f of picked) {
+        const rel = (f.webkitRelativePath || f.name).replace(/\\/g, '/');
+        if (rel.split('/').some(p => FOLDER_IGNORE.has(p))) continue;
+        if (f.size > MAX_FILE_BYTES) { warnings.push('skipped ' + rel + ' (>5 MB)'); continue; }
+        total += f.size;
+        if (total > MAX_TOTAL_BYTES) { warnings.push('total size cap reached, stopped at ' + rel); break; }
+        files.push({ path: rel, content: b64FromBytes(await f.arrayBuffer()) });
+      }
+      resolve({ name: (picked[0].webkitRelativePath || '').split('/')[0] || 'folder', files, warnings });
+    };
+    inp.click();
+  });
+}
+
 linkFolderBtn.addEventListener('click', async () => {
-  if (!FS_SUPPORTED) { folderState.textContent = 'Not supported in this browser — use Chrome, Edge or Firefox.'; return; }
-  try {
-    const h = await window.showDirectoryPicker({ mode: 'readwrite' });
-    const { files, warnings } = await packFolderToFiles(h);
-    folderHandle = h;
-    folderName = h.name;
-    folderFiles = files;
-    folderState.textContent = folderName + ' — ' + files.length + ' file(s)' +
-      (warnings.length ? '; ' + warnings.join('; ') : '');
+  if (FS_SUPPORTED) {
+    try {
+      const h = await window.showDirectoryPicker({ mode: 'readwrite' });
+      const { files, warnings } = await packFolderToFiles(h);
+      folderHandle = h;
+      folderUploadOnly = false;
+      folderName = h.name;
+      folderFiles = files;
+      folderState.textContent = folderName + ' — ' + files.length + ' file(s), write-back enabled' +
+        (warnings.length ? '; ' + warnings.join('; ') : '');
+      unlinkFolderBtn.hidden = false;
+      updateFolderChip();
+      saveSettings();
+    } catch (e) { /* user cancelled picker or error */ }
+  } else {
+    const picked = await pickFolderFallback();
+    if (!picked) return;
+    folderHandle = null;
+    folderUploadOnly = true;
+    folderName = picked.name;
+    folderFiles = picked.files;
+    folderState.textContent = folderName + ' — ' + picked.files.length + ' file(s), upload-only mode (updates come back as a download)' +
+      (picked.warnings.length ? '; ' + picked.warnings.join('; ') : '');
     unlinkFolderBtn.hidden = false;
     updateFolderChip();
     saveSettings();
-  } catch (e) { /* user cancelled picker or error */ }
+  }
 });
 
 unlinkFolderBtn.addEventListener('click', () => {
   folderHandle = null;
+  folderUploadOnly = false;
   folderFiles = [];
   folderName = '';
   unlinkFolderBtn.hidden = true;
@@ -968,7 +1018,7 @@ async function dispatch(s, text) {
           model: modelChoice.model,
           variant: modelChoice.variant || '',
           repo_spec: s.repo_spec || '',
-          workspace_upload: folderHandle ? sid : '',
+          workspace_upload: (folderHandle || folderUploadOnly) ? sid : '',
           api_key: s.apikey || ''
         }
       })
@@ -1099,7 +1149,14 @@ function appendWorkspaceLink(s) {
 }
 
 async function syncWorkspace(s) {
-  if (!folderHandle) return;
+  if (!folderHandle && !folderUploadOnly) return;
+  if (folderUploadOnly) {
+    const url = 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
+               encodeURIComponent(s.repo) + '/' + encodeURIComponent(s.branch).replace(/%2F/g, '/') +
+               '/uploads/' + encodeURIComponent(sid) + '/workspace.json';
+    appendSystem('updated workspace: <a href="' + url + '" target="_blank" rel="noopener">download workspace.json</a>', false);
+    return;
+  }
   const files = await fetchWorkspaceResult(s);
   if (!files) {
     appendSystem(escapeHtml('folder sync: no workspace result yet — check the Actions run.'), false);
@@ -1136,11 +1193,13 @@ async function send() {
   appendUser(text);
   setStatus('dispatching', 'dispatching…');
 
-  if (folderHandle) {
-    setStatus('dispatching', 'packing folder…');
-    const { files, warnings } = await packFolderToFiles(folderHandle);
-    folderFiles = files;
-    if (warnings.length) appendSystem(escapeHtml('folder: ' + warnings.join('; ')), false);
+  if (folderHandle || folderUploadOnly) {
+    if (folderHandle) {
+      setStatus('dispatching', 'packing folder…');
+      const { files, warnings } = await packFolderToFiles(folderHandle);
+      folderFiles = files;
+      if (warnings.length) appendSystem(escapeHtml('folder: ' + warnings.join('; ')), false);
+    }
     const okUp = await uploadWorkspace(s);
     if (!okUp) {
       fail('Upload failed — the PAT also needs Contents read/write for folder linking.');
