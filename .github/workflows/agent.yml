@@ -235,3 +235,5 @@ NODE
           git add -A
           git commit -m "openlink: session ${SID} update" || echo "nothing to commit"
           git push
+
+# (noop: force workflow re-registration)
