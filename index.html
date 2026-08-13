@@ -243,7 +243,8 @@ button:disabled{opacity:.45;cursor:not-allowed}
 }
 .model-chip:hover{border-color:var(--accent)}
 #modelPopover,
-#repoPopover{
+#repoPopover,
+#folderPopover{
   position:absolute;
   left:0;
   bottom:calc(100% + 8px);
@@ -259,11 +260,14 @@ button:disabled{opacity:.45;cursor:not-allowed}
   box-shadow:0 10px 30px rgba(0,0,0,.55);
 }
 #modelPopover[hidden],
-#repoPopover[hidden]{display:none}
+#repoPopover[hidden],
+#folderPopover[hidden]{display:none}
 #modelPopover [hidden],
-#repoPopover [hidden]{display:none}
+#repoPopover [hidden],
+#folderPopover [hidden]{display:none}
 #modelPopover label,
-#repoPopover label{
+#repoPopover label,
+#folderPopover label{
   display:block;
   color:var(--dim);
   font-size:10px;
@@ -274,7 +278,9 @@ button:disabled{opacity:.45;cursor:not-allowed}
 #modelPopover select,
 #modelPopover input,
 #repoPopover select,
-#repoPopover input{
+#repoPopover input,
+#folderPopover select,
+#folderPopover input{
   width:100%;
   background:var(--bg2);
   color:var(--fg);
@@ -287,9 +293,12 @@ button:disabled{opacity:.45;cursor:not-allowed}
 #modelPopover select:focus,
 #modelPopover input:focus,
 #repoPopover select:focus,
-#repoPopover input:focus{outline:none;border-color:var(--accent)}
+#repoPopover input:focus,
+#folderPopover select:focus,
+#folderPopover input:focus{outline:none;border-color:var(--accent)}
 #modelPopover .pop-hint,
-#repoPopover .pop-hint{
+#repoPopover .pop-hint,
+#folderPopover .pop-hint{
   color:var(--dim);
   font-size:11px;
   line-height:1.6;
@@ -345,8 +354,8 @@ button:disabled{opacity:.45;cursor:not-allowed}
     <label for="apikey">OpenCode Go API key (optional)</label>
     <input id="apikey" type="password" autocomplete="off" spellcheck="false">
     <p class="hint">Create the PAT at <a href="https://github.com/settings/personal-access-tokens" target="_blank" rel="noopener">github.com/settings/personal-access-tokens</a>.
-    Fine-grained PAT: grant this repository the <strong>Actions → Workflows: read and write</strong> permission.
-    Classic PAT: tick the <strong>workflow</strong> scope.
+    Fine-grained PAT: grant this repository <strong>Actions → Workflows: read and write</strong> and <strong>Contents → Read and write</strong>.
+    Classic PAT: tick the <strong>workflow</strong> and <strong>repo</strong> scopes.
     The PAT is stored only in this browser's localStorage — never in the URL, the history, or the hash.<br><br>
     <strong>Target repository:</strong> a public GitHub repo the agent works on. It is cloned fresh on the runner each run; the agent's edits persist to the relay repo's <code>workspace/&lt;session&gt;</code> branch. Leave empty to work inside the relay repo itself.<br><br>
     <strong>API key:</strong> prefer a repo secret <code>OPENCODE_API_KEY</code> (never leaves GitHub). A key pasted here is sent as a workflow input and is visible on the public Actions run page — only use it if the repo is private or you accept that exposure.</p>
@@ -356,8 +365,15 @@ button:disabled{opacity:.45;cursor:not-allowed}
 
   <div id="composer">
     <div id="toolbar">
+      <button id="folderBtn" class="model-chip" type="button" title="Link a local folder"></button>
       <button id="repoBtn" class="model-chip" type="button" title="Choose target repository"></button>
       <button id="modelBtn" class="model-chip" type="button" title="Choose model and variant"></button>
+      <div id="folderPopover" hidden>
+        <p class="pop-hint">Link a folder on this laptop: its contents are packed and uploaded to the relay repo each turn, the agent works on them on the runner, and the changed files are written back into your folder. Requires Chrome, Edge or Firefox (File System Access API). Skips <code>.git</code>, <code>node_modules</code>, <code>dist</code>, <code>build</code> and similar.</p>
+        <button id="linkFolderBtn" type="button">Link folder…</button>
+        <button id="unlinkFolderBtn" type="button" hidden>Unlink folder</button>
+        <p class="pop-hint" id="folderState"></p>
+      </div>
       <div id="repoPopover" hidden>
         <label for="repoSpecInput">target repository (agent workspace)</label>
         <input id="repoSpecInput" type="text" autocomplete="off" spellcheck="false" placeholder="owner/repo or owner/repo@branch">
@@ -542,6 +558,7 @@ function appendUser(text) {
   const s = loadSettings();
   const bits = ['via ' + (modelChoice.model || 'model')];
   if (modelChoice.variant) bits.push(modelChoice.variant);
+  if (folderHandle) bits.push('@ folder: ' + folderName);
   if (s.repo_spec) bits.push('@ ' + s.repo_spec);
   b.innerHTML = '<span class="who">you</span>' + escapeHtml(text).replace(/\n/g, '<br>') +
                '<span class="via">' + escapeHtml(bits.join(' · ')) + '</span>';
@@ -767,11 +784,161 @@ document.addEventListener('click', e => {
   if (!repoPopover.hidden && !repoPopover.contains(e.target) && e.target !== repoBtn) {
     repoPopover.hidden = true;
   }
+  if (!folderPopover.hidden && !folderPopover.contains(e.target) && e.target !== folderBtn) {
+    folderPopover.hidden = true;
+  }
 });
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { modelPopover.hidden = true; repoPopover.hidden = true; }
+  if (e.key === 'Escape') { modelPopover.hidden = true; repoPopover.hidden = true; folderPopover.hidden = true; }
 });
+
+// ---------- local folder link ----------
+// A linked folder is packed into {"files":[{path, content(base64)}]} and
+// uploaded to uploads/<session>/workspace.json before each turn; after the
+// turn the runner's re-packed version is written back into the folder.
+const folderBtn = byId('folderBtn');
+const folderPopover = byId('folderPopover');
+const folderState = byId('folderState');
+const linkFolderBtn = byId('linkFolderBtn');
+const unlinkFolderBtn = byId('unlinkFolderBtn');
+const FS_SUPPORTED = typeof window.showDirectoryPicker === 'function';
+const FOLDER_IGNORE = new Set(['.git', 'node_modules', '.DS_Store', 'dist', 'build', '__pycache__', '.venv', 'venv', 'target']);
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 20 * 1024 * 1024;
+let folderHandle = null;   // FileSystemDirectoryHandle
+let folderFiles = [];      // [{path, content(base64)}] last packed snapshot
+let folderName = '';
+
+// ---- pure packing helpers (serialization only) ----
+function b64FromBytes(bytes) {
+  const u8 = new Uint8Array(bytes);
+  let bin = '';
+  for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function b64FromUtf8(str) {
+  return b64FromBytes(new TextEncoder().encode(str));
+}
+function bytesFromB64(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+function packPayload(files) { return JSON.stringify({ files }); }
+function unpackPayload(json) {
+  const data = JSON.parse(json);
+  return (data && Array.isArray(data.files)) ? data.files : [];
+}
+
+// ---- browser-side folder read/write (File System Access API) ----
+async function packFolderToFiles(handle) {
+  const files = [];
+  const warnings = [];
+  let total = 0;
+  async function walk(dir, rel) {
+    for await (const entry of dir.values()) {
+      if (FOLDER_IGNORE.has(entry.name)) continue;
+      const r = rel ? rel + '/' + entry.name : entry.name;
+      if (entry.kind === 'directory') {
+        await walk(await dir.getDirectoryHandle(entry.name), r);
+        continue;
+      }
+      const f = await entry.getFile();
+      if (f.size > MAX_FILE_BYTES) { warnings.push('skipped ' + r + ' (>5 MB)'); continue; }
+      total += f.size;
+      if (total > MAX_TOTAL_BYTES) { warnings.push('total size cap reached, stopped at ' + r); return false; }
+      files.push({ path: r, content: b64FromBytes(await f.arrayBuffer()) });
+    }
+    return true;
+  }
+  await walk(handle, '');
+  return { files, warnings };
+}
+
+async function applyPayloadToFolder(handle, files) {
+  const stats = { written: 0, skipped: 0 };
+  for (const f of files || []) {
+    const rel = String(f.path || '').replace(/\\/g, '/');
+    if (!rel || rel.startsWith('/') || rel.split('/').includes('..')) { stats.skipped++; continue; }
+    const parts = rel.split('/');
+    let dir = handle;
+    for (let i = 0; i < parts.length - 1; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
+    const fh = await dir.getFileHandle(parts[parts.length - 1], { create: true });
+    const w = await fh.createWritable();
+    await w.write(bytesFromB64(f.content || ''));
+    await w.close();
+    stats.written++;
+  }
+  return stats;
+}
+
+function updateFolderChip() {
+  folderBtn.textContent = folderHandle ? 'folder: ' + folderName : 'no folder';
+}
+
+folderBtn.addEventListener('click', () => {
+  const opening = folderPopover.hidden;
+  folderPopover.hidden = !opening;
+  if (opening && !FS_SUPPORTED) {
+    folderState.textContent = 'Not supported in this browser — use Chrome, Edge or Firefox.';
+  }
+});
+
+linkFolderBtn.addEventListener('click', async () => {
+  if (!FS_SUPPORTED) { folderState.textContent = 'Not supported in this browser — use Chrome, Edge or Firefox.'; return; }
+  try {
+    const h = await window.showDirectoryPicker({ mode: 'readwrite' });
+    const { files, warnings } = await packFolderToFiles(h);
+    folderHandle = h;
+    folderName = h.name;
+    folderFiles = files;
+    folderState.textContent = folderName + ' — ' + files.length + ' file(s)' +
+      (warnings.length ? '; ' + warnings.join('; ') : '');
+    unlinkFolderBtn.hidden = false;
+    updateFolderChip();
+    saveSettings();
+  } catch (e) { /* user cancelled picker or error */ }
+});
+
+unlinkFolderBtn.addEventListener('click', () => {
+  folderHandle = null;
+  folderFiles = [];
+  folderName = '';
+  unlinkFolderBtn.hidden = true;
+  folderState.textContent = '';
+  updateFolderChip();
+});
+
+async function uploadWorkspace(s) {
+  const payload = packPayload(folderFiles);
+  const path = 'uploads/' + encodeURIComponent(sid) + '/workspace.json';
+  const url = 'https://api.github.com/repos/' + encodeURIComponent(s.owner) + '/' +
+              encodeURIComponent(s.repo) + '/contents/' + path;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Accept': 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Authorization': 'Bearer ' + s.token,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ message: 'openlink upload ' + sid, branch: s.branch, content: b64FromUtf8(payload) })
+  });
+  return (res.status === 200 || res.status === 201);
+}
+
+async function fetchWorkspaceResult(s) {
+  const url = 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
+             encodeURIComponent(s.repo) + '/' + encodeURIComponent(s.branch).replace(/%2F/g, '/') +
+             '/uploads/' + encodeURIComponent(sid) + '/workspace.json?cb=' + Date.now();
+  try {
+    const res = await fetch(url);
+    if (res.status !== 200) return null;
+    return unpackPayload(await res.text());
+  } catch (e) { return null; }
+}
 
 // ---------- send flow ----------
 function fail(msg) {
@@ -801,6 +968,7 @@ async function dispatch(s, text) {
           model: modelChoice.model,
           variant: modelChoice.variant || '',
           repo_spec: s.repo_spec || '',
+          workspace_upload: folderHandle ? sid : '',
           api_key: s.apikey || ''
         }
       })
@@ -850,6 +1018,7 @@ async function poll(s) {
         }
         setStatus('done', 'done');
         appendWorkspaceLink(s);
+        await syncWorkspace(s);
         return;
       }
       // no session event stream (yet) → fall back to the plain transcript
@@ -863,6 +1032,7 @@ async function poll(s) {
         }
         setStatus('done', 'done');
         appendWorkspaceLink(s);
+        await syncWorkspace(s);
         return;
       }
       // 404 or no new content yet → keep polling
@@ -928,6 +1098,21 @@ function appendWorkspaceLink(s) {
                escapeHtml('workspace/' + sid) + '</a>');
 }
 
+async function syncWorkspace(s) {
+  if (!folderHandle) return;
+  const files = await fetchWorkspaceResult(s);
+  if (!files) {
+    appendSystem(escapeHtml('folder sync: no workspace result yet — check the Actions run.'), false);
+    return;
+  }
+  try {
+    const stats = await applyPayloadToFolder(folderHandle, files);
+    appendSystem(escapeHtml('synced ' + stats.written + ' file(s) to folder ' + folderName), false);
+  } catch (e) {
+    appendSystem(escapeHtml('folder sync failed: ' + e.message), true);
+  }
+}
+
 async function send() {
   if (busy) return;
   const text = inputEl.value.trim();
@@ -950,6 +1135,19 @@ async function send() {
   setBusy(true);
   appendUser(text);
   setStatus('dispatching', 'dispatching…');
+
+  if (folderHandle) {
+    setStatus('dispatching', 'packing folder…');
+    const { files, warnings } = await packFolderToFiles(folderHandle);
+    folderFiles = files;
+    if (warnings.length) appendSystem(escapeHtml('folder: ' + warnings.join('; ')), false);
+    const okUp = await uploadWorkspace(s);
+    if (!okUp) {
+      fail('Upload failed — the PAT also needs Contents read/write for folder linking.');
+      return;
+    }
+  }
+
   const ok = await dispatch(s, text);
   if (!ok) return;
   await poll(s);
@@ -1006,6 +1204,7 @@ byId('settingsBtn').addEventListener('click', () => {
   buildModelOptions();
   renderModelUi();
   updateRepoChip();
+  updateFolderChip();
   setBusy(false);
   setStatus('idle', 'idle');
   inputEl.focus();

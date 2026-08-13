@@ -5,6 +5,13 @@ name: Deploy Pages
 on:
   push:
     branches: [main]
+    # Don't redeploy when the relay or the browser uploads workspace/transcript
+    # data — only code changes to the UI matter.
+    paths-ignore:
+      - 'uploads/**'
+      - 'responses/**'
+      - 'sessions/**'
+      - 'state/**'
   workflow_dispatch: {}
 
 permissions:

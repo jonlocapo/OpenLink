@@ -3,10 +3,14 @@
 # from the client laptop; the browser only talks to api.github.com and
 # raw.githubusercontent.com.
 #
-# The agent runs inside the target repo (input `repo_spec`), keeps its session
-# memory in ~/.local/share/opencode (persisted via Actions cache + --session),
-# and its workspace edits are snapshotted to the relay repo's
-# workspace/<session> branch after every turn.
+# Workspace sources (first match wins):
+#   1. workspace_upload: a linked local folder, packed by the browser into
+#      uploads/<session>/workspace.json ({"files":[{path, content(base64)}]}).
+#      The runner unpacks it, runs the agent inside it, then re-packs the
+#      result into the same file so the browser can write changes back.
+#   2. repo_spec: clone owner/repo[@branch]; agent edits are snapshotted to
+#      the relay repo's workspace/<session> branch.
+#   3. neither: run inside the relay repo itself.
 
 name: OpenLink Agent Relay
 
@@ -28,7 +32,11 @@ on:
         required: false
         default: ""
       repo_spec:
-        description: "Target repo to work on: owner/repo or owner/repo@branch (empty = relay repo itself)"
+        description: "Target repo: owner/repo or owner/repo@branch (used when no folder upload)"
+        required: false
+        default: ""
+      workspace_upload:
+        description: "Session id of a linked-folder upload (uploads/<id>/workspace.json)"
         required: false
         default: ""
       api_key:
@@ -56,6 +64,7 @@ jobs:
       MODEL: ${{ github.event.inputs.model }}
       VARIANT: ${{ github.event.inputs.variant }}
       REPO_SPEC: ${{ github.event.inputs.repo_spec }}
+      WORKSPACE_UPLOAD: ${{ github.event.inputs.workspace_upload }}
       API_KEY_INPUT: ${{ github.event.inputs.api_key }}
       SESSION_FILE: state/${{ github.event.inputs.session_id }}.session
       TRANSCRIPT: responses/${{ github.event.inputs.session_id }}.md
@@ -86,24 +95,51 @@ jobs:
           [ -f "$TRANSCRIPT" ] || printf '# Session %s\n' "$SID" > "$TRANSCRIPT"
           printf '\n## User\n\n%s\n\n## Agent\n\n' "$MSG" >> "$TRANSCRIPT"
 
-      - name: Clone target repo
-        if: env.REPO_SPEC != ''
+      - name: Prepare workspace
+        if: env.WORKSPACE_UPLOAD != '' || env.REPO_SPEC != ''
         run: |
           set -euo pipefail
-          SPEC="$REPO_SPEC"
-          OWNER_REPO="${SPEC%@*}"
-          BR="${SPEC#*@}"; [ "$BR" = "$SPEC" ] && BR=main
-          OWNER="${OWNER_REPO%/*}"; NAME="${OWNER_REPO#*/}"
-          WORKDIR="$HOME/agent-workspace/${OWNER}--${NAME}@${BR}"
-          if ! git clone --depth 1 -b "$BR" "https://github.com/${OWNER}/${NAME}.git" "$WORKDIR" 2>/tmp/clone.err; then
-            printf '_Could not clone %s: %s. Running in the relay repo instead._\n' "$SPEC" "$(tail -n 1 /tmp/clone.err)" >> "$TRANSCRIPT"
-          else
-            # Overlay the previous workspace snapshot (agent edits from earlier turns).
-            if git clone --depth 1 -b "workspace/${SID}" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$HOME/snap" 2>/dev/null; then
-              rsync -a --delete --exclude .git "$HOME/snap/" "$WORKDIR/"
+          if [ -n "$WORKSPACE_UPLOAD" ]; then
+            WD="$HOME/agent-workspace/linked"
+            mkdir -p "$WD"
+            SRC="uploads/$WORKSPACE_UPLOAD/workspace.json"
+            if [ -f "$SRC" ]; then
+              COUNT=$(SRC="$SRC" DST="$WD" node <<'NODE'
+              const fs = require("fs"), path = require("path");
+              const data = JSON.parse(fs.readFileSync(process.env.SRC, "utf8"));
+              let n = 0;
+              for (const f of (data.files || [])) {
+                const rel = String(f.path || "").replace(/\\/g, "/");
+                if (!rel || rel.startsWith("/") || rel.split("/").includes("..")) continue;
+                const p = path.join(process.env.DST, rel);
+                fs.mkdirSync(path.dirname(p), { recursive: true });
+                fs.writeFileSync(p, Buffer.from(f.content || "", "base64"));
+                n++;
+              }
+              console.log(n);
+NODE
+)
+              printf '_Workspace: linked folder (%s files)_\n' "$COUNT" >> "$TRANSCRIPT"
+            else
+              printf '_Workspace upload missing (%s) — empty workspace._\n' "$SRC" >> "$TRANSCRIPT"
             fi
-            echo "$WORKDIR" > /tmp/agent_workdir
-            printf '_Workspace: %s_\n' "$SPEC" >> "$TRANSCRIPT"
+            echo "$WD" > /tmp/agent_workdir
+          else
+            SPEC="$REPO_SPEC"
+            OWNER_REPO="${SPEC%@*}"
+            BR="${SPEC#*@}"; [ "$BR" = "$SPEC" ] && BR=main
+            OWNER="${OWNER_REPO%/*}"; NAME="${OWNER_REPO#*/}"
+            WORKDIR="$HOME/agent-workspace/${OWNER}--${NAME}@${BR}"
+            if ! git clone --depth 1 -b "$BR" "https://github.com/${OWNER}/${NAME}.git" "$WORKDIR" 2>/tmp/clone.err; then
+              printf '_Could not clone %s: %s. Running in the relay repo instead._\n' "$SPEC" "$(tail -n 1 /tmp/clone.err)" >> "$TRANSCRIPT"
+            else
+              # Overlay the previous workspace snapshot (agent edits from earlier turns).
+              if git clone --depth 1 -b "workspace/${SID}" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$HOME/snap" 2>/dev/null; then
+                rsync -a --delete --exclude .git "$HOME/snap/" "$WORKDIR/"
+              fi
+              echo "$WORKDIR" > /tmp/agent_workdir
+              printf '_Workspace: %s_\n' "$SPEC" >> "$TRANSCRIPT"
+            fi
           fi
 
       - name: Run agent (live)
@@ -115,7 +151,7 @@ jobs:
           [ -n "$VARIANT" ] && ARGS+=(--variant "$VARIANT")
           # Resume the opencode session if we have one from a previous run.
           if [ -s "$SESSION_FILE" ]; then ARGS+=(--session "$(cat "$SESSION_FILE")"); fi
-          # Run inside the target repo so the agent's tools see its files.
+          # Run inside the workspace so the agent's tools see its files.
           if [ -f /tmp/agent_workdir ]; then ARGS+=(--dir "$(cat /tmp/agent_workdir)"); fi
           # --auto: approve tool permissions without an interactive prompt.
           ARGS+=(--auto)
@@ -149,6 +185,9 @@ jobs:
           set -euo pipefail
           printf '_Mock reply — no API key configured (add the OPENCODE_API_KEY repo secret, or paste the key in Settings). The relay transport works._\n' >> "$TRANSCRIPT"
           printf '{"type":"text","sessionID":"mock-%s","messageID":"mock-%s-m1","part":{"type":"text","text":"_Mock reply — no API key configured. Add the OPENCODE_API_KEY repo secret or paste the key in Settings. The relay transport works._"}}\n' "$SID" "$SID" >> "$EVENTS"
+          if [ -f /tmp/agent_workdir ]; then
+            printf 'openlink mock round-trip ok\n' > "$(cat /tmp/agent_workdir)/OPENLINK_MOCK.txt"
+          fi
 
       - name: Save agent state
         if: env.OPENCODE_API_KEY != '' || env.API_KEY_INPUT != ''
@@ -157,17 +196,37 @@ jobs:
           path: ~/.local/share/opencode
           key: openlink-state-${{ env.SID }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Snapshot workspace
-        if: env.REPO_SPEC != ''
+      - name: Persist workspace
+        if: env.WORKSPACE_UPLOAD != '' || env.REPO_SPEC != ''
         run: |
           set -euo pipefail
           if [ ! -f /tmp/agent_workdir ]; then exit 0; fi
           WD="$(cat /tmp/agent_workdir)"
-          git -C "$WD" add -A
-          git -C "$WD" -c user.name=openlink-agent -c user.email=openlink-agent@users.noreply.github.com \
-            commit -m "openlink session ${SID}: agent snapshot" || echo "no workspace changes"
-          git -C "$WD" push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            "HEAD:refs/heads/workspace/${SID}" --force
+          if [ -n "$WORKSPACE_UPLOAD" ]; then
+            mkdir -p "uploads/$WORKSPACE_UPLOAD"
+            ROOT="$WD" OUT="uploads/$WORKSPACE_UPLOAD/workspace.json" node <<'NODE'
+            const fs = require("fs"), path = require("path");
+            const IGNORE = new Set([".git"]);
+            const files = [];
+            (function walk(dir, rel) {
+              for (const name of fs.readdirSync(dir)) {
+                if (IGNORE.has(name)) continue;
+                const p = path.join(dir, name);
+                const r = rel ? rel + "/" + name : name;
+                const st = fs.statSync(p);
+                if (st.isDirectory()) walk(p, r);
+                else files.push({ path: r, content: fs.readFileSync(p).toString("base64") });
+              }
+            })(process.env.ROOT, "");
+            fs.writeFileSync(process.env.OUT, JSON.stringify({ files }));
+NODE
+          else
+            git -C "$WD" add -A
+            git -C "$WD" -c user.name=openlink-agent -c user.email=openlink-agent@users.noreply.github.com \
+              commit -m "openlink session ${SID}: agent snapshot" || echo "no workspace changes"
+            git -C "$WD" push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              "HEAD:refs/heads/workspace/${SID}" --force
+          fi
 
       - name: Commit transcript
         run: |

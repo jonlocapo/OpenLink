@@ -26,7 +26,9 @@ The laptop never calls the opencode API. The runner does.
 
 - **Real opencode harness**: the agent loop, model calls, tool execution and permission handling are all opencode's own (`opencode run --auto`). OpenLink only transports prompts in and events out.
 - **Persistent agent memory**: the runner caches `~/.local/share/opencode` (session DB) between runs and resumes with `opencode run --session <id>`, so the agent keeps conversation and tool state across turns.
-- **A real workspace**: the target repo is cloned on the runner each turn, the agent reads/edits it with its tools, and the result is snapshotted to the relay repo's `workspace/<session>` branch — browseable on GitHub.
+- **A real workspace, two ways**:
+  - **Linked local folder** (Chrome/Edge/Firefox): pick a folder on the laptop; it's packed, uploaded before each turn, the agent works on it on the runner, and the changed files are written **back into the local folder** when the turn completes. No repo needed.
+  - **GitHub repo**: set `owner/repo[@branch]`; it's cloned on the runner, the agent edits it, and the result is snapshotted to the relay repo's `workspace/<session>` branch — browseable on GitHub.
 - **Live event stream**: the runner appends the raw NDJSON event stream (`sessions/<session>.ndjson`) to the repo; the UI renders message parts and tool activity live as they land.
 - **Model + variant picker**: all 24 OpenCode Go models with reasoning-effort variants.
 
@@ -46,16 +48,19 @@ The laptop never calls the opencode API. The runner does.
    - Without a key the relay runs in **mock mode** (test the transport first).
 2. **Enable Pages**: Settings → Pages → Source: "Deploy from a branch" → branch `main`, folder `/` → Save. Site appears at `https://<owner>.github.io/OpenLink/` (public Pages = free unlimited Actions minutes).
 3. **Create a GitHub token for the UI** at <https://github.com/settings/personal-access-tokens>:
-   - Fine-grained: repository access → this repo → `Actions → Workflows: read and write`.
-   - Or classic: `workflow` scope.
-4. Open the Pages URL → **Settings** → paste the PAT. Optionally set the **target repository** (`owner/repo` or `owner/repo@branch`, public repos; empty = work inside the relay repo) via the repo chip or Settings. Pick a **model + variant**, then chat.
+   - Fine-grained: repository access → this repo → `Actions → Workflows: read and write` and `Contents → Read and write` (Contents is needed for folder linking).
+   - Or classic: `workflow` + `repo` scopes.
+4. Open the Pages URL → **Settings** → paste the PAT. Then pick your workspace:
+   - **Link a local folder** via the `folder:` chip (Chrome/Edge/Firefox; skips `.git`, `node_modules`, `dist`, `build`; 5 MB/file and 20 MB total caps). The folder is synced both ways each turn.
+   - Or set a **target repository** (`owner/repo` or `owner/repo@branch`, public repos; empty = work inside the relay repo).
+   - Pick a **model + variant**, then chat.
 
 ## How a turn works
 
-1. **Send**: the UI POSTs `POST /repos/{owner}/{repo}/actions/workflows/agent.yml/dispatches` with inputs `{session_id, message, model, variant, repo_spec, api_key}`.
-2. **Run**: a runner restores the cached opencode session DB, clones the target repo (overlaying the previous `workspace/<session>` snapshot so the agent's earlier edits are present), then runs `opencode run <message> --model <model> [--variant v] [--session id] --dir <workspace> --auto --format json` with the Go key from the secret (or the input).
-3. **Persist**: the NDJSON event stream is appended to `sessions/<session>.ndjson`, the session DB is re-cached, the workspace is committed to the `workspace/<session>` branch, and the plain transcript is appended to `responses/<session>.md`.
-4. **Receive**: the UI polls the NDJSON (fallback: the `.md` transcript) every 3s and renders only new events: assistant text per message, plus dim `[tool]` activity lines.
+1. **Send**: (with a linked folder) the UI packs the folder into `{"files":[{path, content(base64)}]}` and PUTs it to `uploads/<session>/workspace.json`, then POSTs `POST /repos/{owner}/{repo}/actions/workflows/agent.yml/dispatches` with inputs `{session_id, message, model, variant, repo_spec, workspace_upload, api_key}`.
+2. **Run**: a runner restores the cached opencode session DB, prepares the workspace (unpack the folder upload, or clone the target repo overlaying the previous `workspace/<session>` snapshot), then runs `opencode run <message> --model <model> [--variant v] [--session id] --dir <workspace> --auto --format json` with the Go key from the secret (or the input).
+3. **Persist**: the NDJSON event stream is appended to `sessions/<session>.ndjson`, the session DB is re-cached, and the workspace is persisted back (re-packed into `uploads/<session>/workspace.json`, or committed to the `workspace/<session>` branch), plus the plain transcript appended to `responses/<session>.md`.
+4. **Receive**: the UI polls the NDJSON (fallback: the `.md` transcript) every 3s and renders only new events: assistant text per message, plus dim `[tool]` activity lines. With a linked folder, the runner's re-packed workspace is then written back into the local folder.
 
 ## Notes & limits
 
