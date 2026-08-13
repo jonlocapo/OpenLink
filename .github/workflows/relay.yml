@@ -97,6 +97,7 @@ jobs:
           [ "$ok" -eq 1 ]
 
       - name: Checkout
+        id: checkout
         uses: actions/checkout@v4
 
       # Persist opencode's session DB between runs so the agent keeps its
@@ -169,8 +170,36 @@ jobs:
           # --auto: approve tool permissions without an interactive prompt.
           ARGS+=(--auto)
 
-          RC=0
-          opencode run "$MSG" "${ARGS[@]}" --format json > /tmp/events.ndjson 2>/tmp/agent.err || RC=$?
+          git config user.name openlink-agent
+          git config user.email openlink-agent@users.noreply.github.com
+
+          # Clear the live stream first so the UI knows a new turn started.
+          mkdir -p streams
+          : > "streams/${SID}.ndjson"
+          git add "streams/${SID}.ndjson"
+          git commit -m "stream ${SID} clear" >/dev/null 2>&1 || true
+          git push origin "HEAD:refs/heads/stream/${SID}" --force >/dev/null 2>&1 || true
+
+          # Run opencode in the background and publish the event stream to the
+          # stream/<session> branch every ~5s, so reasoning and tool activity
+          # appear in the UI while the agent is still working.
+          opencode run "$MSG" "${ARGS[@]}" --format json > /tmp/events.ndjson 2>/tmp/agent.err &
+          OC_PID=$!
+          while kill -0 "$OC_PID" 2>/dev/null; do
+            sleep 5
+            cp -f /tmp/events.ndjson "streams/${SID}.ndjson" 2>/dev/null || true
+            git add "streams/${SID}.ndjson"
+            git commit -m "stream ${SID} tick" >/dev/null 2>&1 || true
+            git push origin "HEAD:refs/heads/stream/${SID}" --force >/dev/null 2>&1 || true
+          done
+          wait "$OC_PID"; RC=$?
+          cp -f /tmp/events.ndjson "streams/${SID}.ndjson" 2>/dev/null || true
+          git add "streams/${SID}.ndjson"
+          git commit -m "stream ${SID} final" >/dev/null 2>&1 || true
+          git push origin "HEAD:refs/heads/stream/${SID}" --force >/dev/null 2>&1 || true
+          # Discard the intermediate stream commits locally so the final
+          # "Commit transcript" push to main carries only this turn's files.
+          git reset --hard origin/main
 
           # Always land whatever events exist, even on failure.
           if [ -s /tmp/events.ndjson ]; then
@@ -221,7 +250,9 @@ jobs:
           fi
 
       - name: Commit transcript
-        if: always()
+        # Only run if the checkout exists — a validation failure skips it, and
+        # git would otherwise fail in an uninitialised directory.
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
         run: |
           git config user.name "openlink-agent"
           git config user.email "openlink-agent@users.noreply.github.com"
