@@ -125,6 +125,6 @@ jobs:
         run: |
           git config user.name "openlink-agent"
           git config user.email "openlink-agent@users.noreply.github.com"
-          git add responses state
+          git add -A
           git commit -m "openlink: session ${SID} update" || echo "nothing to commit"
           git push
