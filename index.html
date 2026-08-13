@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenLink — agent chat</title>
+<style>
+:root{
+  --bg:#0a0e14;
+  --bg2:#0e1420;
+  --panel:#111827;
+  --border:#1f2a37;
+  --fg:#d7dee8;
+  --dim:#7d8a99;
+  --accent:#34d399;
+  --accent-dim:#14532d;
+  --err:#f87171;
+  --ok:#4ade80;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--fg);
+  font-family:var(--mono);
+  font-size:14px;
+  line-height:1.55;
+}
+#app{
+  max-width:860px;
+  margin:0 auto;
+  height:100%;
+  display:flex;
+  flex-direction:column;
+  padding:0 12px;
+}
+header{
+  padding:14px 2px 10px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  align-items:center;
+  gap:12px;
+  flex-wrap:wrap;
+}
+.logo{font-size:16px;font-weight:700;letter-spacing:.5px}
+.logo .open{color:var(--accent)}
+.session{color:var(--dim);font-size:12px}
+.actions{margin-left:auto;display:flex;gap:8px}
+button{
+  background:var(--panel);
+  color:var(--fg);
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:7px 12px;
+  font-family:var(--mono);
+  font-size:12px;
+  cursor:pointer;
+}
+button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+#sendBtn{
+  background:var(--accent-dim);
+  border-color:var(--accent);
+  color:#d1fae5;
+  font-weight:700;
+}
+#sendBtn:hover:not(:disabled){background:var(--accent);color:#04120c}
+#status{
+  padding:8px 2px;
+  font-size:12px;
+  color:var(--dim);
+  border-bottom:1px solid var(--border);
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+#status .dot{
+  width:8px;height:8px;border-radius:50%;
+  background:var(--dim);flex:none;
+}
+#status.state-dispatching{color:var(--accent)}
+#status.state-dispatching .dot{background:var(--accent)}
+#status.state-thinking{color:var(--accent)}
+#status.state-thinking .dot{background:var(--accent);animation:pulse 1s infinite}
+#status.state-done{color:var(--ok)}
+#status.state-done .dot{background:var(--ok)}
+#status.state-error{color:var(--err)}
+#status.state-error .dot{background:var(--err)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+#settings{
+  display:none;
+  border-bottom:1px solid var(--border);
+  padding:12px 2px;
+  font-size:12px;
+}
+#settings.open{display:block}
+#settings label{display:block;margin:8px 0 3px;color:var(--dim)}
+#settings input{
+  width:100%;
+  background:var(--bg2);
+  color:var(--fg);
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:7px 10px;
+  font-family:var(--mono);
+  font-size:13px;
+}
+#settings input:focus{outline:none;border-color:var(--accent)}
+#settings .hint{color:var(--dim);margin-top:10px;line-height:1.6}
+#settings .hint a{color:var(--accent)}
+#chat{
+  flex:1;
+  overflow-y:auto;
+  padding:18px 2px 8px;
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.bubble{
+  max-width:82%;
+  padding:9px 12px;
+  border:1px solid var(--border);
+  border-radius:8px;
+  overflow-wrap:break-word;
+}
+.bubble .who{
+  display:block;
+  font-size:10px;
+  letter-spacing:1px;
+  text-transform:uppercase;
+  color:var(--dim);
+  margin-bottom:4px;
+}
+.bubble.user{align-self:flex-end;background:var(--panel);border-color:var(--accent-dim)}
+.bubble.user .who{color:var(--accent)}
+.bubble .via{
+  display:block;
+  font-size:10px;
+  color:var(--dim);
+  margin-top:5px;
+  letter-spacing:0;
+  text-transform:none;
+  overflow-wrap:anywhere;
+}
+.bubble.agent{align-self:flex-start;background:var(--bg2)}
+.bubble.system{
+  align-self:center;
+  background:transparent;
+  border-style:dashed;
+  color:var(--dim);
+  text-align:center;
+  max-width:100%;
+  font-size:12px;
+}
+.bubble.system.error{color:var(--err);border-color:var(--err)}
+.bubble.system a{color:var(--accent);overflow-wrap:anywhere}
+.bubble .md-body{white-space:pre-wrap}
+.bubble .md-label{
+  display:block;
+  font-size:10px;
+  letter-spacing:1px;
+  text-transform:uppercase;
+  color:var(--accent);
+  margin:6px 0 2px;
+}
+.bubble .md-label:first-child{margin-top:0}
+.bubble code{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:4px;
+  padding:1px 5px;
+  font-family:var(--mono);
+  font-size:12px;
+  color:var(--accent);
+}
+.bubble pre{
+  background:#070b10;
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:10px;
+  overflow-x:auto;
+  font-family:var(--mono);
+  font-size:12px;
+  line-height:1.45;
+  color:#cbd5e1;
+  margin:6px 0;
+}
+.bubble pre code{border:none;background:none;padding:0;color:inherit}
+.thinking{
+  align-self:flex-start;
+  color:var(--dim);
+  font-size:12px;
+  padding:4px 2px;
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+.thinking .dots span{
+  display:inline-block;
+  width:4px;height:4px;margin-right:3px;
+  border-radius:50%;background:var(--accent);
+  animation:blink 1.2s infinite;
+}
+.thinking .dots span:nth-child(2){animation-delay:.2s}
+.thinking .dots span:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,100%{opacity:.15}50%{opacity:1}}
+#composer{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  padding:10px 0 14px;
+}
+#composerRow{display:flex;gap:8px}
+#toolbar{
+  position:relative;
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+.model-chip{
+  background:var(--bg2);
+  color:var(--accent);
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:4px 10px;
+  font-size:11px;
+  cursor:pointer;
+  max-width:100%;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.model-chip:hover{border-color:var(--accent)}
+#modelPopover{
+  position:absolute;
+  left:0;
+  bottom:calc(100% + 8px);
+  z-index:20;
+  min-width:280px;
+  max-width:340px;
+  max-height:60vh;
+  overflow-y:auto;
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:12px;
+  box-shadow:0 10px 30px rgba(0,0,0,.55);
+}
+#modelPopover[hidden]{display:none}
+#modelPopover [hidden]{display:none}
+#modelPopover label{
+  display:block;
+  color:var(--dim);
+  font-size:10px;
+  letter-spacing:1px;
+  text-transform:uppercase;
+  margin:6px 0 3px;
+}
+#modelPopover select,
+#modelPopover input{
+  width:100%;
+  background:var(--bg2);
+  color:var(--fg);
+  border:1px solid var(--border);
+  border-radius:6px;
+  padding:6px 8px;
+  font-family:var(--mono);
+  font-size:12px;
+}
+#modelPopover select:focus,
+#modelPopover input:focus{outline:none;border-color:var(--accent)}
+#input{
+  flex:1;
+  resize:none;
+  background:var(--bg2);
+  color:var(--fg);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:10px 12px;
+  font-family:var(--mono);
+  font-size:13px;
+  line-height:1.5;
+  min-height:44px;
+  max-height:160px;
+}
+#input:focus{outline:none;border-color:var(--accent)}
+#input:disabled{opacity:.55}
+@media (max-width:600px){
+  #app{max-width:100%}
+  .bubble{max-width:92%}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="logo">Open<span class="open">Link</span></span>
+    <span class="session" id="sessionLabel">session —</span>
+    <div class="actions">
+      <button id="newBtn">New session</button>
+      <button id="settingsBtn">Settings</button>
+    </div>
+  </header>
+
+  <div id="status"><span class="dot"></span><span id="statusText">idle</span></div>
+
+  <div id="settings">
+    <label for="owner">owner</label>
+    <input id="owner" type="text" autocomplete="off" spellcheck="false">
+    <label for="repo">repo</label>
+    <input id="repo" type="text" autocomplete="off" spellcheck="false">
+    <label for="branch">branch</label>
+    <input id="branch" type="text" autocomplete="off" spellcheck="false">
+    <label for="token">personal access token (PAT)</label>
+    <input id="token" type="password" autocomplete="off" spellcheck="false">
+    <p class="hint">Create a token at <a href="https://github.com/settings/personal-access-tokens" target="_blank" rel="noopener">github.com/settings/personal-access-tokens</a>.
+    Fine-grained PAT: grant this repository the <strong>Actions → Workflows: read and write</strong> permission.
+    Classic PAT: tick the <strong>workflow</strong> scope.
+    The token is stored only in this browser's localStorage — never in the URL, the history, or the hash.</p>
+  </div>
+
+  <div id="chat"></div>
+
+  <div id="composer">
+    <div id="toolbar">
+      <button id="modelBtn" class="model-chip" type="button" title="Choose model and variant"></button>
+    </div>
+    <div id="composerRow">
+      <textarea id="input" rows="1" placeholder="Ask the agent something… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button id="sendBtn" disabled>Send</button>
+    </div>
+    <div id="modelPopover" hidden>
+      <label for="modelSelect">model</label>
+      <select id="modelSelect"></select>
+      <div id="variantWrap">
+        <label for="variantSelect">variant</label>
+        <select id="variantSelect"></select>
+      </div>
+      <div id="customFields" hidden>
+        <label for="customModelInput">custom model id</label>
+        <input id="customModelInput" type="text" autocomplete="off" spellcheck="false" placeholder="provider/model-id">
+        <label for="customVariantInput">variant (optional)</label>
+        <input id="customVariantInput" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. long">
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ---------- model registry ----------
+// The ONLY place model data lives. Swap these entries freely; the picker,
+// chip label, dispatch payload and chat captions all derive from here.
+// Generic reasoning-effort variants accepted by opencode's --variant flag
+// (OpenAI-style effort levels; leave on "default" for models without effort control).
+const EFFORT_VARIANTS = [
+  { id: "", label: "default" }, { id: "minimal", label: "minimal" },
+  { id: "low", label: "low" }, { id: "medium", label: "medium" },
+  { id: "high", label: "high" }, { id: "xhigh", label: "xhigh" }
+];
+const MODELS = [
+  { id: "opencode-go/gpt-5.6-luna", label: "GPT-5.6 Luna (2x usage)", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/deepseek-v4-pro", label: "DeepSeek V4 Pro", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/deepseek-v4-flash", label: "DeepSeek V4 Flash (2x usage)", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/kimi-k3", label: "Kimi K3", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/kimi-k2.7-code", label: "Kimi K2.7 Code", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/kimi-k2.6", label: "Kimi K2.6", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/kimi-k2.5", label: "Kimi K2.5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/grok-4.5", label: "Grok 4.5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/qwen3.8-max", label: "Qwen3.8 Max", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/qwen3.7-max", label: "Qwen3.7 Max", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/qwen3.7-plus", label: "Qwen3.7 Plus", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/qwen3.6-plus", label: "Qwen3.6 Plus", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/qwen3.5-plus", label: "Qwen3.5 Plus", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/glm-5.2", label: "GLM-5.2", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/glm-5.1", label: "GLM-5.1", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/glm-5", label: "GLM-5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/minimax-m3", label: "MiniMax-M3", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/minimax-m2.7", label: "MiniMax-M2.7", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/minimax-m2.5", label: "MiniMax-M2.5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/mimo-v2.5-pro", label: "MiMo V2.5 Pro", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/mimo-v2.5", label: "MiMo V2.5", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/mimo-v2-pro", label: "MiMo V2 Pro", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/mimo-v2-omni", label: "MiMo V2 Omni", provider: "OpenCode Go", variants: EFFORT_VARIANTS },
+  { id: "opencode-go/hy3", label: "Hy3", provider: "OpenCode Go", variants: EFFORT_VARIANTS }
+];
+
+// ---------- helpers ----------
+const byId = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Tiny markdown-ish renderer: "## Heading" → label, ``` fences → <pre>,
+// `inline code` → <code>. Input is escaped first; ~25 lines.
+function renderMarkdown(text) {
+  const lines = escapeHtml(text).split('\n');
+  let html = '';
+  let inCode = false;
+  for (let raw of lines) {
+    const line = raw.replace(/\s+$/, '');
+    if (line.startsWith('```')) {
+      html += inCode ? '</pre>' : '<pre>';
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) { html += line + '\n'; continue; }
+    if (line.startsWith('## ')) {
+      html += '<span class="md-label">' + line.slice(3).trim() + '</span>\n';
+      continue;
+    }
+    html += line.replace(/`([^`]+)`/g, '<code>$1</code>') + '\n';
+  }
+  if (inCode) html += '</pre>';
+  return html;
+}
+
+// ---------- storage ----------
+const SETTINGS_KEY = 'openlink-settings';
+const SESSION_KEY = 'openlink-session';
+const DEFAULT_SETTINGS = { owner: 'jonlocapo', repo: 'OpenLink', branch: 'main', token: '' };
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    return Object.assign({}, DEFAULT_SETTINGS, raw ? JSON.parse(raw) : {});
+  } catch (e) {
+    return Object.assign({}, DEFAULT_SETTINGS);
+  }
+}
+
+function saveSettings() {
+  const s = {
+    owner: byId('owner').value.trim(),
+    repo: byId('repo').value.trim(),
+    branch: byId('branch').value.trim(),
+    token: byId('token').value.trim()
+  };
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+}
+
+function newSessionId() {
+  const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+  let s = '';
+  for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * 36)];
+  return 's-' + s;
+}
+
+function sessionId() {
+  let id = localStorage.getItem(SESSION_KEY);
+  if (!id) { id = newSessionId(); localStorage.setItem(SESSION_KEY, id); }
+  return id;
+}
+
+// ---------- state ----------
+const chatEl = byId('chat');
+const inputEl = byId('input');
+const statusEl = byId('status');
+const statusText = byId('statusText');
+let sid = sessionId();
+let prevContent = ''; // last known transcript content
+let busy = false;
+
+// ---------- UI helpers ----------
+function setStatus(state, text) {
+  statusEl.className = 'state-' + state;
+  statusText.textContent = text;
+}
+
+function setBusy(b) {
+  inputEl.disabled = b;
+  byId('sendBtn').disabled = b || !inputEl.value.trim();
+  byId('newBtn').disabled = b;
+}
+
+function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
+
+function appendUser(text) {
+  const b = document.createElement('div');
+  b.className = 'bubble user';
+  const via = 'via ' + (modelChoice.model || 'model');
+  const caption = modelChoice.variant ? via + ' · ' + modelChoice.variant : via;
+  b.innerHTML = '<span class="who">you</span>' + escapeHtml(text).replace(/\n/g, '<br>') +
+               '<span class="via">' + escapeHtml(caption) + '</span>';
+  chatEl.appendChild(b);
+  scrollBottom();
+}
+
+function appendAssistant(html) {
+  const b = document.createElement('div');
+  b.className = 'bubble agent';
+  b.innerHTML = '<span class="who">agent</span><div class="md-body">' + html + '</div>';
+  chatEl.appendChild(b);
+  scrollBottom();
+}
+
+function appendSystem(text, isError) {
+  const b = document.createElement('div');
+  b.className = 'bubble system' + (isError ? ' error' : '');
+  b.innerHTML = text;
+  chatEl.appendChild(b);
+  scrollBottom();
+}
+
+function showThinking() {
+  if (byId('thinkEl')) return;
+  const el = document.createElement('div');
+  el.id = 'thinkEl';
+  el.className = 'thinking';
+  el.innerHTML = '<span class="dots"><span></span><span></span><span></span></span><span>agent thinking…</span>';
+  chatEl.appendChild(el);
+  scrollBottom();
+}
+
+function hideThinking() {
+  const el = byId('thinkEl');
+  if (el) el.remove();
+}
+
+// ---------- model picker ----------
+const MODEL_KEY = 'openlink-model';
+const CUSTOM_VALUE = '__custom__';
+
+const modelBtn = byId('modelBtn');
+const modelPopover = byId('modelPopover');
+const modelSelect = byId('modelSelect');
+const variantWrap = byId('variantWrap');
+const variantSelect = byId('variantSelect');
+const customFields = byId('customFields');
+const customModelInput = byId('customModelInput');
+const customVariantInput = byId('customVariantInput');
+
+let modelChoice = loadModelChoice();
+let customMode = false;
+
+function modelEntry(id) { return MODELS.find(m => m.id === id); }
+
+function defaultVariant(m) {
+  const variants = (m.variants && m.variants.length) ? m.variants : [];
+  if (!variants.length) return '';
+  const def = variants.find(v => v.id === '');
+  return def ? '' : variants[0].id;
+}
+
+function defaultModelChoice() {
+  const m = MODELS[0];
+  return { model: m.id, variant: defaultVariant(m) };
+}
+
+function loadModelChoice() {
+  try {
+    const raw = localStorage.getItem(MODEL_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (p && typeof p.model === 'string') {
+        return { model: p.model, variant: typeof p.variant === 'string' ? p.variant : '' };
+      }
+    }
+  } catch (e) { /* corrupted → fall through to defaults */ }
+  return defaultModelChoice();
+}
+
+function saveModelChoice() {
+  try { localStorage.setItem(MODEL_KEY, JSON.stringify(modelChoice)); } catch (e) { /* ignore */ }
+}
+
+function chipLabel() {
+  const base = modelChoice.model || 'model';
+  return modelChoice.variant ? base + ' (' + modelChoice.variant + ')' : base;
+}
+
+function updateChip() { modelBtn.textContent = chipLabel(); }
+
+function buildModelOptions() {
+  const groups = new Map();
+  MODELS.forEach(m => {
+    if (!groups.has(m.provider)) groups.set(m.provider, []);
+    groups.get(m.provider).push(m);
+  });
+  let html = '';
+  groups.forEach((list, provider) => {
+    html += '<optgroup label="' + escapeHtml(provider) + '">';
+    list.forEach(m => {
+      html += '<option value="' + escapeHtml(m.id) + '">' + escapeHtml(m.label) + '</option>';
+    });
+    html += '</optgroup>';
+  });
+  html += '<option value="' + CUSTOM_VALUE + '">Custom model…</option>';
+  modelSelect.innerHTML = html;
+}
+
+function buildVariantOptions(modelId) {
+  const m = modelEntry(modelId);
+  const variants = (m && m.variants && m.variants.length) ? m.variants : [];
+  variantSelect.innerHTML = '';
+  if (!variants.length) { variantWrap.hidden = true; return; }
+  let html = '';
+  variants.forEach(v => {
+    html += '<option value="' + escapeHtml(v.id) + '">' + escapeHtml(v.label) + '</option>';
+  });
+  variantSelect.innerHTML = html;
+  variantWrap.hidden = false;
+}
+
+function renderModelUi() {
+  const inList = !customMode && modelEntry(modelChoice.model);
+  if (inList) {
+    modelSelect.value = modelChoice.model;
+    customFields.hidden = true;
+    buildVariantOptions(modelChoice.model);
+    variantSelect.value = modelChoice.variant;
+    variantWrap.hidden = false;
+  } else {
+    modelSelect.value = CUSTOM_VALUE;
+    customFields.hidden = false;
+    variantWrap.hidden = true;
+    customModelInput.value = modelChoice.model;
+    customVariantInput.value = modelChoice.variant;
+  }
+  updateChip();
+}
+
+function syncCustom() {
+  modelChoice.model = customModelInput.value.trim();
+  modelChoice.variant = customVariantInput.value.trim();
+  updateChip();
+  saveModelChoice();
+}
+
+modelBtn.addEventListener('click', () => {
+  const opening = modelPopover.hidden;
+  modelPopover.hidden = !opening;
+  if (opening) {
+    renderModelUi();
+    if (customFields.hidden) modelSelect.focus(); else customModelInput.focus();
+  }
+});
+
+modelSelect.addEventListener('change', () => {
+  if (modelSelect.value === CUSTOM_VALUE) {
+    customMode = true;
+    customFields.hidden = false;
+    variantWrap.hidden = true;
+    customModelInput.value = modelChoice.model;
+    customVariantInput.value = modelChoice.variant;
+    saveModelChoice();
+    customModelInput.focus();
+  } else {
+    customMode = false;
+    const m = modelEntry(modelSelect.value);
+    if (!m) return;
+    modelChoice.model = m.id;
+    modelChoice.variant = defaultVariant(m);
+    buildVariantOptions(m.id);
+    variantSelect.value = modelChoice.variant;
+    variantWrap.hidden = false;
+    renderModelUi();
+    saveModelChoice();
+  }
+});
+
+variantSelect.addEventListener('change', () => {
+  if (customMode) return;
+  modelChoice.variant = variantSelect.value;
+  updateChip();
+  saveModelChoice();
+});
+
+customModelInput.addEventListener('input', syncCustom);
+customVariantInput.addEventListener('input', syncCustom);
+
+document.addEventListener('click', e => {
+  if (!modelPopover.hidden && !modelPopover.contains(e.target) && e.target !== modelBtn) {
+    modelPopover.hidden = true;
+  }
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') modelPopover.hidden = true;
+});
+
+// ---------- send flow ----------
+function fail(msg) {
+  setStatus('error', 'error');
+  appendSystem(escapeHtml(msg), true);
+  busy = false;
+  setBusy(false);
+}
+
+async function dispatch(s, text) {
+  const url = 'https://api.github.com/repos/' + encodeURIComponent(s.owner) + '/' +
+              encodeURIComponent(s.repo) + '/actions/workflows/agent.yml/dispatches';
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Authorization': 'Bearer ' + s.token,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        ref: s.branch,
+        inputs: { session_id: sid, message: text, model: modelChoice.model, variant: modelChoice.variant || '' }
+      })
+    });
+    if (res.status === 204) return true;
+    if (res.status === 401) {
+      fail('Authentication failed — the PAT is invalid or expired (see Settings).');
+    } else if (res.status === 403) {
+      fail('Permission denied — the PAT needs the "workflow" scope (classic) or "Actions → Workflows: read and write" (fine-grained).');
+    } else if (res.status === 404) {
+      fail('Workflow not found — check that owner/repo are correct and agent.yml exists on branch "' + s.branch + '".');
+    } else {
+      fail('Dispatch failed — HTTP ' + res.status + '.');
+    }
+  } catch (e) {
+    fail('Network error while dispatching: ' + e.message);
+  }
+  return false;
+}
+
+async function poll(s) {
+  const started = Date.now();
+  const MAX_MS = 240000; // 240s max, polling every 3s
+  const branchPath = encodeURIComponent(s.branch).replace(/%2F/g, '/');
+  const rawUrl = () => 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
+                       encodeURIComponent(s.repo) + '/' + branchPath + '/responses/' + sid + '.md?cb=' + Date.now();
+  showThinking();
+  setStatus('thinking', 'agent thinking… (0s)');
+  let lastSec = -1;
+  const tick = setInterval(() => {
+    const sec = Math.floor((Date.now() - started) / 1000);
+    if (sec !== lastSec) { lastSec = sec; setStatus('thinking', 'agent thinking… (' + sec + 's)'); }
+  }, 250);
+  try {
+    while (Date.now() - started < MAX_MS) {
+      await sleep(3000);
+      let res;
+      try { res = await fetch(rawUrl()); } catch (e) { continue; } // transient blip → keep polling
+      if (res.status === 200) {
+        const content = await res.text();
+        if (content.length > prevContent.length) {
+          const delta = content.slice(prevContent.length);
+          prevContent = content;
+          if (delta.trim()) {
+            hideThinking();
+            appendAssistant(renderMarkdown(delta));
+          }
+          setStatus('done', 'done');
+          return;
+        }
+      }
+      // 404 or no new content yet → keep polling
+    }
+    // timeout
+    hideThinking();
+    const link = 'https://github.com/' + encodeURIComponent(s.owner) + '/' + encodeURIComponent(s.repo) + '/actions';
+    appendSystem(escapeHtml('Timed out after 150s — the response file was never updated. Check the workflow run: ') +
+                 '<a href="' + link + '" target="_blank" rel="noopener">' + link + '</a>', true);
+    setStatus('error', 'error');
+  } catch (e) {
+    hideThinking();
+    appendSystem(escapeHtml('Polling error: ' + e.message), true);
+    setStatus('error', 'error');
+  } finally {
+    clearInterval(tick);
+    busy = false;
+    setBusy(false);
+  }
+}
+
+async function send() {
+  if (busy) return;
+  const text = inputEl.value.trim();
+  if (!text) return;
+  const s = loadSettings();
+  if (!s.owner || !s.repo || !s.branch || !s.token) {
+    setStatus('error', 'error');
+    appendSystem(escapeHtml('Missing settings — open Settings and fill in owner, repo, branch and token.'), true);
+    byId('settings').classList.add('open');
+    byId('settingsBtn').textContent = 'Close settings';
+    return;
+  }
+  busy = true;
+  inputEl.value = '';
+  setBusy(true);
+  appendUser(text);
+  setStatus('dispatching', 'dispatching…');
+  const ok = await dispatch(s, text);
+  if (!ok) return;
+  await poll(s);
+}
+
+// ---------- events ----------
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (!busy && inputEl.value.trim()) send();
+  }
+});
+
+inputEl.addEventListener('input', () => {
+  byId('sendBtn').disabled = busy || !inputEl.value.trim();
+});
+
+byId('sendBtn').addEventListener('click', send);
+
+byId('newBtn').addEventListener('click', () => {
+  if (busy) return;
+  if (!confirm('Start a new session? The current chat will be cleared.')) return;
+  sid = newSessionId();
+  localStorage.setItem(SESSION_KEY, sid);
+  prevContent = '';
+  chatEl.innerHTML = '';
+  hideThinking();
+  setStatus('idle', 'idle');
+  byId('sessionLabel').textContent = 'session ' + sid;
+  inputEl.focus();
+});
+
+byId('settingsBtn').addEventListener('click', () => {
+  const panel = byId('settings');
+  const open = panel.classList.toggle('open');
+  byId('settingsBtn').textContent = open ? 'Close settings' : 'Settings';
+});
+
+['owner', 'repo', 'branch', 'token'].forEach(id =>
+  byId(id).addEventListener('input', saveSettings)
+);
+
+// ---------- init ----------
+(function init() {
+  const s = loadSettings();
+  byId('owner').value = s.owner;
+  byId('repo').value = s.repo;
+  byId('branch').value = s.branch;
+  byId('token').value = s.token;
+  byId('sessionLabel').textContent = 'session ' + sid;
+  buildModelOptions();
+  renderModelUi();
+  setBusy(false);
+  setStatus('idle', 'idle');
+  inputEl.focus();
+})();
+</script>
+</body>
+</html>

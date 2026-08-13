@@ -1,0 +1,130 @@
+# OpenLink Agent Relay
+# Runs the opencode agent harness headlessly on a GitHub runner, so that
+# opencode API traffic originates from GitHub's infrastructure, never from
+# the client laptop. The browser only ever talks to api.github.com and
+# raw.githubusercontent.com.
+#
+# Set the repo secret OPENCODE_API_KEY to your OpenCode Go key
+# (https://opencode.ai/auth) to go live. Without it, runs fall back to a
+# mock reply so the transport can be tested end-to-end.
+
+name: OpenLink Agent Relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: "Session id (filesystem-safe string)"
+        required: true
+      message:
+        description: "Latest user message"
+        required: true
+      model:
+        description: "Model id, e.g. opencode-go/gpt-5.6-luna"
+        required: false
+        default: "opencode-go/gpt-5.6-luna"
+      variant:
+        description: "Optional reasoning-effort variant (minimal|low|medium|high|xhigh)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: openlink-${{ github.event.inputs.session_id }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_DISABLE_AUTOUPDATE: "true"
+      SID: ${{ github.event.inputs.session_id }}
+      MSG: ${{ github.event.inputs.message }}
+      MODEL: ${{ github.event.inputs.model }}
+      VARIANT: ${{ github.event.inputs.variant }}
+      SESSION_FILE: state/${{ github.event.inputs.session_id }}.session
+      TRANSCRIPT: responses/${{ github.event.inputs.session_id }}.md
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Persist opencode's session DB (~/.local/share/opencode) between runs
+      # so the agent keeps its memory and tool state. restore-keys picks the
+      # most recent entry for this session.
+      - name: Restore agent state
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.local/share/opencode
+          key: openlink-state-${{ env.SID }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            openlink-state-${{ env.SID }}-
+
+      - name: Install opencode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          opencode --version
+
+      - name: Run agent (live)
+        if: env.OPENCODE_API_KEY != ''
+        run: |
+          set -euo pipefail
+          mkdir -p responses state
+          [ -f "$TRANSCRIPT" ] || printf '# Session %s\n' "$SID" > "$TRANSCRIPT"
+          printf '\n## User\n\n%s\n\n## Agent\n\n' "$MSG" >> "$TRANSCRIPT"
+
+          ARGS=(--model "$MODEL")
+          [ -n "$VARIANT" ] && ARGS+=(--variant "$VARIANT")
+          # Resume the opencode session if we have one from a previous run.
+          if [ -s "$SESSION_FILE" ]; then
+            ARGS+=(--session "$(cat "$SESSION_FILE")")
+          fi
+
+          opencode run "$MSG" "${ARGS[@]}" --format json > /tmp/events.ndjson
+
+          # Extract assistant text from the NDJSON event stream and record the
+          # sessionID so the next run can resume this session.
+          node <<'NODE' >> "$TRANSCRIPT"
+          const fs = require("fs");
+          let sessionID = "";
+          let out = "";
+          for (const line of fs.readFileSync("/tmp/events.ndjson", "utf8").split("\n")) {
+            if (!line) continue;
+            try {
+              const e = JSON.parse(line);
+              if (e.sessionID && !sessionID) sessionID = e.sessionID;
+              if (e.type === "text" && e.part && e.part.text) out += e.part.text;
+            } catch {}
+          }
+          if (sessionID && !fs.existsSync(process.env.SESSION_FILE)) {
+            fs.writeFileSync(process.env.SESSION_FILE, sessionID);
+          }
+          process.stdout.write(out);
+          NODE
+
+      - name: Run agent (mock — no OPENCODE_API_KEY secret)
+        if: env.OPENCODE_API_KEY == ''
+        run: |
+          set -euo pipefail
+          mkdir -p responses
+          [ -f "$TRANSCRIPT" ] || printf '# Session %s\n' "$SID" > "$TRANSCRIPT"
+          printf '\n## User\n\n%s\n\n## Agent\n\n_Mock reply — no OPENCODE_API_KEY secret configured in this repo. The relay transport works; add the secret at https://opencode.ai/auth to go live._\n' "$MSG" >> "$TRANSCRIPT"
+
+      - name: Save agent state
+        if: env.OPENCODE_API_KEY != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.local/share/opencode
+          key: openlink-state-${{ env.SID }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Commit transcript
+        run: |
+          git config user.name "openlink-agent"
+          git config user.email "openlink-agent@users.noreply.github.com"
+          git add responses state
+          git commit -m "openlink: session ${SID} update" || echo "nothing to commit"
+          git push
