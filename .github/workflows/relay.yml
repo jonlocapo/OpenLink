@@ -160,6 +160,10 @@ jobs:
         if: env.OPENCODE_API_KEY != '' || env.API_KEY_INPUT != ''
         run: |
           set -uo pipefail
+          # Actions runs steps with `bash -e` by default; clear it so a
+          # non-zero `wait` below doesn't abort the step before the error
+          # path runs.
+          set +e
           if [ -n "$API_KEY_INPUT" ]; then export OPENCODE_API_KEY="$API_KEY_INPUT"; fi
           ARGS=(--model "$MODEL")
           [ -n "$VARIANT" ] && ARGS+=(--variant "$VARIANT")
@@ -173,33 +177,57 @@ jobs:
           git config user.name openlink-agent
           git config user.email openlink-agent@users.noreply.github.com
 
-          # Clear the live stream first so the UI knows a new turn started.
-          mkdir -p streams
-          : > "streams/${SID}.ndjson"
-          git add "streams/${SID}.ndjson"
-          git commit -m "stream ${SID} clear" >/dev/null 2>&1 || true
-          git push origin "HEAD:refs/heads/stream/${SID}" --force >/dev/null 2>&1 || true
+          # Publish the event stream to the stream/<session> branch WITHOUT
+          # touching the local branch or its index. (A `git reset` here would
+          # discard this turn's uncommitted transcript header — the user's
+          # message — before the reply is appended.)
+          stream_push() {
+            rm -f /tmp/stream-index
+            GIT_INDEX_FILE=/tmp/stream-index git read-tree --empty 2>/dev/null
+            GIT_INDEX_FILE=/tmp/stream-index git add "streams/${SID}.ndjson" 2>/dev/null
+            TREE=$(GIT_INDEX_FILE=/tmp/stream-index git write-tree 2>/dev/null)
+            [ -z "$TREE" ] && return 1
+            PARENT=$(git rev-parse --verify "refs/remotes/origin/stream/${SID}" 2>/dev/null)
+            if [ -n "$PARENT" ]; then
+              COMMIT=$(printf 'stream %s' "$SID" | git commit-tree "$TREE" -p "$PARENT")
+            else
+              COMMIT=$(printf 'stream %s' "$SID" | git commit-tree "$TREE")
+            fi
+            git update-ref "refs/heads/stream/${SID}" "$COMMIT"
+            git push origin "stream/${SID}:stream/${SID}" --force >/dev/null 2>&1
+          }
 
           # Run opencode in the background and publish the event stream to the
           # stream/<session> branch every ~5s, so reasoning and tool activity
           # appear in the UI while the agent is still working.
-          opencode run "$MSG" "${ARGS[@]}" --format json > /tmp/events.ndjson 2>/tmp/agent.err &
-          OC_PID=$!
-          while kill -0 "$OC_PID" 2>/dev/null; do
-            sleep 5
-            cp -f /tmp/events.ndjson "streams/${SID}.ndjson" 2>/dev/null || true
-            git add "streams/${SID}.ndjson"
-            git commit -m "stream ${SID} tick" >/dev/null 2>&1 || true
-            git push origin "HEAD:refs/heads/stream/${SID}" --force >/dev/null 2>&1 || true
-          done
-          wait "$OC_PID"; RC=$?
-          cp -f /tmp/events.ndjson "streams/${SID}.ndjson" 2>/dev/null || true
-          git add "streams/${SID}.ndjson"
-          git commit -m "stream ${SID} final" >/dev/null 2>&1 || true
-          git push origin "HEAD:refs/heads/stream/${SID}" --force >/dev/null 2>&1 || true
-          # Discard the intermediate stream commits locally so the final
-          # "Commit transcript" push to main carries only this turn's files.
-          git reset --hard origin/main
+          run_agent() {
+            mkdir -p streams
+            : > "streams/${SID}.ndjson"
+            stream_push
+            opencode run "$MSG" "${ARGS[@]}" --format json > /tmp/events.ndjson 2>/tmp/agent.err &
+            OC_PID=$!
+            while kill -0 "$OC_PID" 2>/dev/null; do
+              sleep 5
+              cp -f /tmp/events.ndjson "streams/${SID}.ndjson" 2>/dev/null
+              stream_push
+            done
+            wait "$OC_PID"; RC=$?
+            cp -f /tmp/events.ndjson "streams/${SID}.ndjson" 2>/dev/null
+            stream_push
+            # The stream file must never reach main — remove it so the final
+            # "Commit transcript" git add -A skips it.
+            rm -f "streams/${SID}.ndjson"
+          }
+
+          run_agent
+          # opencode server errors (UnknownError/RateLimitError/...) are often
+          # transient — retry once before giving up. Context-overflow failures
+          # on oversized sessions will fail again, and the error then lands in
+          # the stream for the UI to show.
+          if [ "$RC" -ne 0 ] && grep -qE '"name":"(UnknownError|RateLimitError|InternalServerError|TimeoutError|Error)"' /tmp/events.ndjson 2>/dev/null; then
+            echo "::warning::opencode server error detected — retrying once"
+            run_agent
+          fi
 
           # Always land whatever events exist, even on failure.
           if [ -s /tmp/events.ndjson ]; then
