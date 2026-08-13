@@ -51,20 +51,21 @@ The laptop never calls the opencode API. The runner does.
    - Fine-grained: repository access → this repo → `Actions → Workflows: read and write` and `Contents → Read and write` (Contents is needed for folder linking).
    - Or classic: `workflow` + `repo` scopes.
 4. Open the Pages URL → **Settings** → paste the PAT. Then pick your workspace:
-   - **Link a local folder** via the `folder:` chip (Chrome/Edge/Firefox; skips `.git`, `node_modules`, `dist`, `build`; 5 MB/file and 20 MB total caps). The folder is synced both ways each turn.
+   - **Link a local folder** via the `folder:` chip (Chrome/Edge/Firefox; skips `.git`, `node_modules`, `.build`, `dist`, `vendor`, `DerivedData` and similar; 10 MB/file and 1 GB total caps). The folder is synced both ways each turn.
    - Or set a **target repository** (`owner/repo` or `owner/repo@branch`, public repos; empty = work inside the relay repo).
    - Pick a **model + variant**, then chat.
 
 ## How a turn works
 
-1. **Send**: (with a linked folder) the UI packs the folder into `{"files":[{path, content(base64)}]}` and PUTs it to `uploads/<session>/workspace.json`, then POSTs `POST /repos/{owner}/{repo}/actions/workflows/relay.yml/dispatches` with inputs `{session_id, message, model, variant, repo_spec, workspace_upload, api_key}`.
+1. **Send**: (with a linked folder) the UI packs the folder into chunks of `{"files":[{path, content(base64)}]}` and PUTs them to `uploads/<session>/chunk.NNN.json` (then a `manifest.json` last, so the runner never sees a partial set), then POSTs `POST /repos/{owner}/{repo}/actions/workflows/relay.yml/dispatches` with inputs `{session_id, message, model, variant, repo_spec, workspace_upload, api_key}`.
 2. **Run**: a runner restores the cached opencode session DB, prepares the workspace (unpack the folder upload, or clone the target repo overlaying the previous `workspace/<session>` snapshot), then runs `opencode run <message> --model <model> [--variant v] [--session id] --dir <workspace> --auto --format json` with the Go key from the secret (or the input).
-3. **Persist**: the NDJSON event stream is appended to `sessions/<session>.ndjson`, the session DB is re-cached, and the workspace is persisted back (re-packed into `uploads/<session>/workspace.json`, or committed to the `workspace/<session>` branch), plus the plain transcript appended to `responses/<session>.md`.
+3. **Persist**: the NDJSON event stream is appended to `sessions/<session>.ndjson`, the session DB is re-cached, and the workspace is persisted back (re-packed into `uploads/<session>/manifest.json` + `chunk.NNN.json`, or committed to the `workspace/<session>` branch), plus the plain transcript appended to `responses/<session>.md`.
 4. **Receive**: the UI polls the NDJSON (fallback: the `.md` transcript) every 3s and renders only new events: assistant text per message, plus dim `[tool]` activity lines. With a linked folder, the runner's re-packed workspace is then written back into the local folder.
 
 ## Notes & limits
 
-- **Scope**: use this within the bounds of your competition/engagement. Don't push sensitive data through it — transcripts and event streams are committed to the repo (visible publicly if the repo is public). The API-key input is likewise visible on the run page.
+- **Scope**: use this within the bounds of your competition/engagement. Don't push sensitive data through it — transcripts, event streams and workspace blobs are committed to the repo (visible publicly if the repo is public). The API-key input is likewise visible on the run page.
+- **Pages privacy**: the deployed site contains only `index.html` (the workflow assembles a `_site` dir); workspace/transcript data is never published to the site, only stored in the repo.
 - **Workspace edits** are snapshotted to the relay repo, not pushed back to the target repo (that would need a PAT with write access to it — possible extension).
 - **Switching target repos mid-session**: opencode sessions are scoped to a project directory; start a new session when you change `owner/repo@branch`.
 - **Costs**: public repos get free Actions minutes; each turn is one workflow run (~1 min, longer when the agent uses tools). Run timeouts: 15 min per turn; the UI polls up to 6 min.

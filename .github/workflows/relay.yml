@@ -5,14 +5,16 @@
 #
 # Workspace sources (first match wins):
 #   1. workspace_upload: a linked local folder, packed by the browser into
-#      uploads/<session>/workspace.json ({"files":[{path, content(base64)}]}).
-#      The runner unpacks it, runs the agent inside it, then re-packs the
-#      result into the same file so the browser can write changes back.
+#      uploads/<session>/manifest.json + chunk.NNN.json
+#      ({"files":[{path, content(base64)}]} per chunk). The runner unpacks it,
+#      runs the agent inside it, then re-packs the result into the same layout
+#      so the browser can write changes back.
 #   2. repo_spec: clone owner/repo[@branch]; agent edits are snapshotted to
 #      the relay repo's workspace/<session> branch.
 #   3. neither: run inside the relay repo itself.
 
 name: OpenLink Agent Relay
+run-name: openlink ${{ inputs.session_id }}
 
 on:
   workflow_dispatch:
@@ -36,7 +38,7 @@ on:
         required: false
         default: ""
       workspace_upload:
-        description: "Session id of a linked-folder upload (uploads/<id>/workspace.json)"
+        description: "Session id of a linked-folder upload (uploads/<id>/manifest.json)"
         required: false
         default: ""
       api_key:
@@ -57,7 +59,6 @@ jobs:
     timeout-minutes: 15
     env:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      GH_TOKEN: ${{ github.token }}
       OPENCODE_DISABLE_AUTOUPDATE: "true"
       SID: ${{ github.event.inputs.session_id }}
       MSG: ${{ github.event.inputs.message }}
@@ -70,6 +71,31 @@ jobs:
       TRANSCRIPT: responses/${{ github.event.inputs.session_id }}.md
       EVENTS: sessions/${{ github.event.inputs.session_id }}.ndjson
     steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ -n "$API_KEY_INPUT" ]; then
+            echo "::add-mask::$API_KEY_INPUT"
+          fi
+          ok=1
+          case "$SID" in
+            ''|'.'|'..'|*[!A-Za-z0-9._-]*)
+              echo "::error::invalid session_id"; ok=0 ;;
+          esac
+          if [ -n "$WORKSPACE_UPLOAD" ]; then
+            case "$WORKSPACE_UPLOAD" in
+              '.'|'..'|*[!A-Za-z0-9._-]*)
+                echo "::error::invalid workspace_upload"; ok=0 ;;
+            esac
+          fi
+          if [ -n "$REPO_SPEC" ]; then
+            case "$REPO_SPEC" in
+              *'..'*|*[!A-Za-z0-9._@/-]*|*'//'*)
+                echo "::error::invalid repo_spec"; ok=0 ;;
+            esac
+          fi
+          [ "$ok" -eq 1 ]
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -97,17 +123,18 @@ jobs:
 
       - name: Prepare workspace
         if: env.WORKSPACE_UPLOAD != '' || env.REPO_SPEC != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ -n "$WORKSPACE_UPLOAD" ]; then
             WD="$HOME/agent-workspace/linked"
             mkdir -p "$WD"
-            SRC="uploads/$WORKSPACE_UPLOAD/workspace.json"
-            if [ -f "$SRC" ]; then
-              COUNT=$(SRC="$SRC" DST="$WD" node scripts/unpack-workspace.js)
+            if [ -f "uploads/$WORKSPACE_UPLOAD/manifest.json" ]; then
+              COUNT=$(SID="$WORKSPACE_UPLOAD" DST="$WD" node scripts/unpack-workspace.js)
               printf '_Workspace: linked folder (%s files)_\n' "$COUNT" >> "$TRANSCRIPT"
             else
-              printf '_Workspace upload missing (%s) — empty workspace._\n' "$SRC" >> "$TRANSCRIPT"
+              printf '_Workspace upload missing (uploads/%s/manifest.json) — empty workspace._\n' "$WORKSPACE_UPLOAD" >> "$TRANSCRIPT"
             fi
             echo "$WD" > /tmp/agent_workdir
           else
@@ -131,7 +158,7 @@ jobs:
       - name: Run agent (live)
         if: env.OPENCODE_API_KEY != '' || env.API_KEY_INPUT != ''
         run: |
-          set -euo pipefail
+          set -uo pipefail
           if [ -n "$API_KEY_INPUT" ]; then export OPENCODE_API_KEY="$API_KEY_INPUT"; fi
           ARGS=(--model "$MODEL")
           [ -n "$VARIANT" ] && ARGS+=(--variant "$VARIANT")
@@ -142,9 +169,21 @@ jobs:
           # --auto: approve tool permissions without an interactive prompt.
           ARGS+=(--auto)
 
-          opencode run "$MSG" "${ARGS[@]}" --format json > /tmp/events.ndjson
-          cat /tmp/events.ndjson >> "$EVENTS"
-          EVENTS_FILE=/tmp/events.ndjson SESSION_FILE="$SESSION_FILE" node scripts/extract-transcript.js >> "$TRANSCRIPT"
+          RC=0
+          opencode run "$MSG" "${ARGS[@]}" --format json > /tmp/events.ndjson 2>/tmp/agent.err || RC=$?
+
+          # Always land whatever events exist, even on failure.
+          if [ -s /tmp/events.ndjson ]; then
+            cat /tmp/events.ndjson >> "$EVENTS" || true
+            EVENTS_FILE=/tmp/events.ndjson SESSION_FILE="$SESSION_FILE" node scripts/extract-transcript.js >> "$TRANSCRIPT" || true
+          fi
+          if [ "$RC" -ne 0 ]; then
+            ERRLINE=$(tail -c 2000 /tmp/agent.err 2>/dev/null | tr '\n' ' ' || true)
+            ERRLINE="${ERRLINE:-opencode exited with code $RC}"
+            printf '\n_Agent error (exit %s): %s_\n' "$RC" "$ERRLINE" >> "$TRANSCRIPT" || true
+            EVENTS_FILE="$EVENTS" ERROR_TEXT="$ERRLINE" RC="$RC" node scripts/append-error.js || true
+            exit "$RC"
+          fi
 
       - name: Run agent (mock — no API key configured)
         if: env.OPENCODE_API_KEY == '' && env.API_KEY_INPUT == ''
@@ -157,21 +196,22 @@ jobs:
           fi
 
       - name: Save agent state
-        if: env.OPENCODE_API_KEY != '' || env.API_KEY_INPUT != ''
+        if: ${{ always() && (env.OPENCODE_API_KEY != '' || env.API_KEY_INPUT != '') }}
         uses: actions/cache/save@v4
         with:
           path: ~/.local/share/opencode
           key: openlink-state-${{ env.SID }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Persist workspace
-        if: env.WORKSPACE_UPLOAD != '' || env.REPO_SPEC != ''
+        if: ${{ always() && (env.WORKSPACE_UPLOAD != '' || env.REPO_SPEC != '') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ ! -f /tmp/agent_workdir ]; then exit 0; fi
           WD="$(cat /tmp/agent_workdir)"
           if [ -n "$WORKSPACE_UPLOAD" ]; then
-            mkdir -p "uploads/$WORKSPACE_UPLOAD"
-            ROOT="$WD" OUT="uploads/$WORKSPACE_UPLOAD/workspace.json" node scripts/repack-workspace.js
+            ROOT="$WD" SID="$WORKSPACE_UPLOAD" node scripts/repack-workspace.js
           else
             git -C "$WD" add -A
             git -C "$WD" -c user.name=openlink-agent -c user.email=openlink-agent@users.noreply.github.com \
@@ -181,9 +221,18 @@ jobs:
           fi
 
       - name: Commit transcript
+        if: always()
         run: |
           git config user.name "openlink-agent"
           git config user.email "openlink-agent@users.noreply.github.com"
           git add -A
           git commit -m "openlink: session ${SID} update" || echo "nothing to commit"
+          # The browser uploads to main via the Contents API concurrently;
+          # rebase and retry so a non-fast-forward push never loses the turn.
+          for i in 1 2 3 4 5; do
+            if git push; then exit 0; fi
+            git fetch origin
+            git rebase "origin/${GITHUB_REF_NAME:-main}" 2>/dev/null || git rebase --abort
+            sleep $((i * 5))
+          done
           git push

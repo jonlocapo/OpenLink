@@ -804,13 +804,26 @@ const folderState = byId('folderState');
 const linkFolderBtn = byId('linkFolderBtn');
 const unlinkFolderBtn = byId('unlinkFolderBtn');
 const FS_SUPPORTED = typeof window.showDirectoryPicker === 'function';
-const FOLDER_IGNORE = new Set(['.git', 'node_modules', '.DS_Store', 'dist', 'build', '__pycache__', '.venv', 'venv', 'target']);
-const MAX_FILE_BYTES = 5 * 1024 * 1024;
-const MAX_TOTAL_BYTES = 20 * 1024 * 1024;
+const FOLDER_IGNORE = new Set(['.git', 'node_modules', '.DS_Store', 'dist', 'build', '__pycache__',
+  '.venv', 'venv', 'target', '.build', 'vendor', '.cargo', 'DerivedData', 'Pods', '.next', '.cache', '.idea']);
+const FOLDER_IGNORE_RE = /^opencode-debug|\.dSYM$/;
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 1024 * 1024 * 1024; // 1 GB total cap (per-file cap is 10 MB)
+const CHUNK_BYTES = 64 * 1024 * 1024; // per-chunk decoded cap (Contents API limit is 100 MB)
+const MAX_WARNINGS = 8;
 let folderHandle = null;   // FileSystemDirectoryHandle (write-back mode)
 let folderUploadOnly = false; // true = upload-only fallback (no FS Access API)
 let folderFiles = [];      // [{path, content(base64)}] last packed snapshot
 let folderName = '';
+let lastUploadedPayload = ''; // serialized payload this browser uploaded last
+
+function isIgnoredName(name) { return FOLDER_IGNORE.has(name) || FOLDER_IGNORE_RE.test(name); }
+
+function fmtBytes(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024) return Math.round(n / 1024) + ' KB';
+  return n + ' B';
+}
 
 // ---- pure packing helpers (serialization only) ----
 function b64FromBytes(bytes) {
@@ -838,25 +851,35 @@ function unpackPayload(json) {
 async function packFolderToFiles(handle) {
   const files = [];
   const warnings = [];
+  let dropped = 0;
   let total = 0;
+  let stopped = false;
+  const warn = (msg) => {
+    if (warnings.length < MAX_WARNINGS) warnings.push(msg);
+    else dropped++;
+  };
   async function walk(dir, rel) {
     for await (const entry of dir.values()) {
-      if (FOLDER_IGNORE.has(entry.name)) continue;
+      if (stopped) return;
+      if (isIgnoredName(entry.name)) continue;
       const r = rel ? rel + '/' + entry.name : entry.name;
       if (entry.kind === 'directory') {
         await walk(await dir.getDirectoryHandle(entry.name), r);
         continue;
       }
       const f = await entry.getFile();
-      if (f.size > MAX_FILE_BYTES) { warnings.push('skipped ' + r + ' (>5 MB)'); continue; }
+      if (f.size > MAX_FILE_BYTES) { warn('skipped ' + r + ' (' + fmtBytes(f.size) + ')'); continue; }
       total += f.size;
-      if (total > MAX_TOTAL_BYTES) { warnings.push('total size cap reached, stopped at ' + r); return false; }
+      if (total > MAX_TOTAL_BYTES) {
+        warn('size limit reached — stopped at ' + r + ' (' + fmtBytes(total - f.size) + ' packed)');
+        stopped = true;
+        return;
+      }
       files.push({ path: r, content: b64FromBytes(await f.arrayBuffer()) });
     }
-    return true;
   }
   await walk(handle, '');
-  return { files, warnings };
+  return { files, warnings, dropped, totalBytes: total };
 }
 
 async function applyPayloadToFolder(handle, files) {
@@ -882,11 +905,26 @@ function updateFolderChip() {
   else folderBtn.textContent = 'no folder';
 }
 
+// Diagnose why the File System Access API is unavailable, for the popover.
+function fsDiagnosis() {
+  if (typeof window.showDirectoryPicker === 'function') return '';
+  if (window.isSecureContext === false) {
+    return 'This page is not running in a secure (https) context, so the API is blocked. Open it over https.';
+  }
+  const ua = navigator.userAgent || '';
+  if (/Firefox\//.test(ua)) {
+    return 'Firefox hides this API in private-browsing windows and when privacy hardening is on. ' +
+           'Open the site in a normal window, and check about:config: dom.fs.enabled must be true, ' +
+           'privacy.resistFingerprinting must be false.';
+  }
+  return 'This browser does not expose the File System Access API (needed for automatic write-back).';
+}
+
 folderBtn.addEventListener('click', () => {
   const opening = folderPopover.hidden;
   folderPopover.hidden = !opening;
   if (opening && !FS_SUPPORTED) {
-    folderState.textContent = 'Write-back needs Firefox 135+ (not private browsing), Chrome or Edge. You can still pick a folder to upload — upload-only mode.';
+    folderState.textContent = fsDiagnosis() + ' Meanwhile you can still pick a folder to upload (upload-only mode).';
   }
 });
 
@@ -906,32 +944,43 @@ function pickFolderFallback() {
       if (!picked.length) return resolve(null);
       const files = [];
       const warnings = [];
+      let dropped = 0;
       let total = 0;
+      const warn = (msg) => {
+        if (warnings.length < MAX_WARNINGS) warnings.push(msg);
+        else dropped++;
+      };
       for (const f of picked) {
         const rel = (f.webkitRelativePath || f.name).replace(/\\/g, '/');
-        if (rel.split('/').some(p => FOLDER_IGNORE.has(p))) continue;
-        if (f.size > MAX_FILE_BYTES) { warnings.push('skipped ' + rel + ' (>5 MB)'); continue; }
+        const parts = rel.split('/');
+        if (parts.some(p => isIgnoredName(p))) continue;
+        if (f.size > MAX_FILE_BYTES) { warn('skipped ' + rel + ' (' + fmtBytes(f.size) + ')'); continue; }
         total += f.size;
-        if (total > MAX_TOTAL_BYTES) { warnings.push('total size cap reached, stopped at ' + rel); break; }
+        if (total > MAX_TOTAL_BYTES) {
+          warn('size limit reached — stopped at ' + rel + ' (' + fmtBytes(total - f.size) + ' packed)');
+          break;
+        }
         files.push({ path: rel, content: b64FromBytes(await f.arrayBuffer()) });
       }
-      resolve({ name: (picked[0].webkitRelativePath || '').split('/')[0] || 'folder', files, warnings });
+      resolve({ name: (picked[0].webkitRelativePath || '').split('/')[0] || 'folder', files, warnings, dropped, totalBytes: total });
     };
     inp.click();
   });
 }
 
 linkFolderBtn.addEventListener('click', async () => {
+  const describe = (files, warnings, dropped, totalBytes) =>
+    files.length + ' file(s) · ' + fmtBytes(totalBytes) +
+    (warnings.length ? '; ' + warnings.join('; ') + (dropped ? ' (+' + dropped + ' more)' : '') : '');
   if (FS_SUPPORTED) {
     try {
       const h = await window.showDirectoryPicker({ mode: 'readwrite' });
-      const { files, warnings } = await packFolderToFiles(h);
+      const { files, warnings, dropped, totalBytes } = await packFolderToFiles(h);
       folderHandle = h;
       folderUploadOnly = false;
       folderName = h.name;
       folderFiles = files;
-      folderState.textContent = folderName + ' — ' + files.length + ' file(s), write-back enabled' +
-        (warnings.length ? '; ' + warnings.join('; ') : '');
+      folderState.textContent = folderName + ' — ' + describe(files, warnings, dropped, totalBytes) + ' · write-back enabled';
       unlinkFolderBtn.hidden = false;
       updateFolderChip();
       saveSettings();
@@ -943,8 +992,8 @@ linkFolderBtn.addEventListener('click', async () => {
     folderUploadOnly = true;
     folderName = picked.name;
     folderFiles = picked.files;
-    folderState.textContent = folderName + ' — ' + picked.files.length + ' file(s), upload-only mode (updates come back as a download)' +
-      (picked.warnings.length ? '; ' + picked.warnings.join('; ') : '');
+    folderState.textContent = folderName + ' — ' + describe(picked.files, picked.warnings, picked.dropped, picked.totalBytes) +
+      ' · upload-only mode (updates come back as a download)';
     unlinkFolderBtn.hidden = false;
     updateFolderChip();
     saveSettings();
@@ -961,32 +1010,110 @@ unlinkFolderBtn.addEventListener('click', () => {
   updateFolderChip();
 });
 
-async function uploadWorkspace(s) {
-  const payload = packPayload(folderFiles);
-  const path = 'uploads/' + encodeURIComponent(sid) + '/workspace.json';
-  const url = 'https://api.github.com/repos/' + encodeURIComponent(s.owner) + '/' +
+// ---- chunked workspace transport ----
+// A workspace is uploaded as uploads/<session>/manifest.json + chunk.NNN.json
+// files (each chunk <= CHUNK_BYTES of decoded data, safely under the Contents
+// API's 100 MB limit). Manifest is written last so the runner never sees a
+// partial set. Same layout comes back from the runner's re-pack.
+
+function chunkFiles(files) {
+  const chunks = [];
+  let cur = [];
+  let curBytes = 0;
+  for (const f of files) {
+    const bytes = Math.ceil((f.content || '').length * 3 / 4); // base64 → decoded
+    if (cur.length && curBytes + bytes > CHUNK_BYTES) {
+      chunks.push(cur);
+      cur = [];
+      curBytes = 0;
+    }
+    cur.push(f);
+    curBytes += bytes;
+  }
+  if (cur.length) chunks.push(cur);
+  return chunks.map((c, i) => ({ name: 'chunk.' + String(i).padStart(3, '0') + '.json', files: c }));
+}
+
+function workspaceSig(manifestJson, chunkPayloads) {
+  return manifestJson + '\u0000' + chunkPayloads.join('\u0000');
+}
+
+async function putContents(s, path, payload) {
+  const api = 'https://api.github.com/repos/' + encodeURIComponent(s.owner) + '/' +
               encodeURIComponent(s.repo) + '/contents/' + path;
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      'Accept': 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'Authorization': 'Bearer ' + s.token,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ message: 'openlink upload ' + sid, branch: s.branch, content: b64FromUtf8(payload) })
-  });
-  return (res.status === 200 || res.status === 201);
+  const headers = {
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Authorization': 'Bearer ' + s.token,
+    'Content-Type': 'application/json'
+  };
+  const body = { message: 'openlink upload ' + sid, branch: s.branch, content: b64FromUtf8(payload) };
+  // The file persists across turns; updating it requires its current sha.
+  // Fetch it, and re-fetch + retry once on 409/422 races.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!body.sha) {
+      try {
+        const g = await fetch(api + '?ref=' + encodeURIComponent(s.branch), { headers });
+        if (g.status === 200) {
+          const info = await g.json();
+          if (info && info.sha) body.sha = info.sha;
+        }
+      } catch (e) { /* proceed without sha */ }
+    }
+    let res;
+    try {
+      res = await fetch(api, { method: 'PUT', headers, body: JSON.stringify(body) });
+    } catch (e) {
+      return { ok: false, status: 0, detail: String(e && e.message || 'network error') };
+    }
+    if (res.status === 200 || res.status === 201) return { ok: true };
+    if (res.status !== 409 && res.status !== 422) {
+      let detail = '';
+      try { detail = String((await res.text()) || '').slice(0, 300); } catch (e) { /* ignore */ }
+      return { ok: false, status: res.status, detail };
+    }
+    // 409/422: stale (or missing) sha — refresh and retry once.
+    delete body.sha;
+  }
+  return { ok: false, status: 409, detail: 'upload conflict after retry' };
+}
+
+async function uploadWorkspace(s, chunks, manifestJson) {
+  for (const c of chunks) {
+    const r = await putContents(s, 'uploads/' + encodeURIComponent(sid) + '/' + c.name,
+                                JSON.stringify({ files: c.files }));
+    if (!r.ok) return r;
+  }
+  return putContents(s, 'uploads/' + encodeURIComponent(sid) + '/manifest.json', manifestJson);
 }
 
 async function fetchWorkspaceResult(s) {
-  const url = 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
-             encodeURIComponent(s.repo) + '/' + encodeURIComponent(s.branch).replace(/%2F/g, '/') +
-             '/uploads/' + encodeURIComponent(sid) + '/workspace.json?cb=' + Date.now();
+  const base = 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
+               encodeURIComponent(s.repo) + '/' + encodeURIComponent(s.branch).replace(/%2F/g, '/') +
+               '/uploads/' + encodeURIComponent(sid) + '/';
+  const cb = '?cb=' + Date.now();
   try {
-    const res = await fetch(url);
-    if (res.status !== 200) return null;
-    return unpackPayload(await res.text());
+    const mres = await fetch(base + 'manifest.json' + cb);
+    if (mres.status !== 200) return null;
+    const manifestJson = await mres.text();
+    let manifest;
+    try { manifest = JSON.parse(manifestJson); } catch (e) { return null; }
+    const names = Array.isArray(manifest.chunks) ? manifest.chunks : [];
+    const files = [];
+    let sig = manifestJson;
+    for (const n of names) {
+      if (!/^chunk\.\d{3}\.json$/.test(String(n))) return null;
+      const r = await fetch(base + n + cb);
+      if (r.status !== 200) return null;
+      const text = await r.text();
+      sig += '\u0000' + text;
+      const data = JSON.parse(text);
+      if (data && Array.isArray(data.files)) files.push.apply(files, data.files);
+    }
+    // raw.githubusercontent may still serve the copies this browser uploaded
+    // before the turn — identical content means the runner hasn't updated yet.
+    if (lastUploadedPayload && sig === lastUploadedPayload) return null;
+    return files;
   } catch (e) { return null; }
 }
 
@@ -1047,6 +1174,8 @@ async function poll(s) {
                encodeURIComponent(s.repo) + '/' + branchPath + '/';
   const ndUrl = () => base + 'sessions/' + sid + '.ndjson?cb=' + Date.now();
   const mdUrl = () => base + 'responses/' + sid + '.md?cb=' + Date.now();
+  let runLookupDisabled = false;
+  let tickNum = 0;
   showThinking();
   setStatus('thinking', 'agent thinking… (0s)');
   let lastSec = -1;
@@ -1057,6 +1186,25 @@ async function poll(s) {
   try {
     while (Date.now() - started < MAX_MS) {
       await sleep(3000);
+      tickNum++;
+      // Every other tick, check the Actions run so we can fail fast instead of
+      // spinning for 6 minutes on a broken run.
+      if (!runLookupDisabled && tickNum % 2 === 0) {
+        const st = await checkRunStatus(s, started);
+        if (st.startsWith('failed:')) {
+          hideThinking();
+          appendSystem(escapeHtml('The workflow run failed: ') + '<a href="' + escapeHtml(st.slice(7)) +
+                       '" target="_blank" rel="noopener">' + escapeHtml(st.slice(7)) + '</a>', true);
+          setStatus('error', 'error');
+          clearInterval(tick);
+          busy = false;
+          setBusy(false);
+          return;
+        }
+        if (st === 'forbidden') runLookupDisabled = true;
+        else if (st === 'queued') setStatus('thinking', 'queued…');
+        else if (st === 'in_progress') setStatus('thinking', 'agent running…');
+      }
       let res;
       try { res = await fetch(ndUrl()); } catch (e) { continue; } // transient blip → keep polling
       if (res.status === 200) {
@@ -1065,11 +1213,18 @@ async function poll(s) {
           const delta = content.slice(prevNd.length);
           prevNd = content;
           if (renderEventsDelta(delta)) hideThinking();
+          // refresh the transcript baseline so a later md fallback renders only new text
+          try {
+            const m = await fetch(mdUrl());
+            if (m.status === 200) prevMd = await m.text();
+          } catch (e) { /* ignore */ }
+          setStatus('done', 'done');
+          appendWorkspaceLink(s);
+          await syncWorkspace(s);
+          return;
         }
-        setStatus('done', 'done');
-        appendWorkspaceLink(s);
-        await syncWorkspace(s);
-        return;
+        // 200 but unchanged → the runner hasn't appended yet; keep polling.
+        continue;
       }
       // no session event stream (yet) → fall back to the plain transcript
       try { res = await fetch(mdUrl()); } catch (e) { continue; }
@@ -1079,11 +1234,16 @@ async function poll(s) {
           const delta = content.slice(prevMd.length);
           prevMd = content;
           if (delta.trim()) { hideThinking(); appendAssistant(renderMarkdown(delta)); }
+          try {
+            const n = await fetch(ndUrl());
+            if (n.status === 200) prevNd = await n.text();
+          } catch (e) { /* ignore */ }
+          setStatus('done', 'done');
+          appendWorkspaceLink(s);
+          await syncWorkspace(s);
+          return;
         }
-        setStatus('done', 'done');
-        appendWorkspaceLink(s);
-        await syncWorkspace(s);
-        return;
+        continue; // unchanged → keep polling
       }
       // 404 or no new content yet → keep polling
     }
@@ -1101,6 +1261,38 @@ async function poll(s) {
     clearInterval(tick);
     busy = false;
     setBusy(false);
+  }
+}
+
+// Look up the latest run of this session's workflow (matched by run-name).
+// Returns 'forbidden' (disable lookup), 'queued', 'in_progress', 'done',
+// 'failed:<html_url>' or 'unknown'.
+async function checkRunStatus(s, started) {
+  const url = 'https://api.github.com/repos/' + encodeURIComponent(s.owner) + '/' +
+              encodeURIComponent(s.repo) +
+              '/actions/workflows/relay.yml/runs?per_page=15&exclude_pull_requests=true';
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Authorization': 'Bearer ' + s.token
+      }
+    });
+    if (res.status === 401 || res.status === 403 || res.status === 404) return 'forbidden';
+    if (res.status !== 200) return 'unknown';
+    const j = await res.json();
+    const runs = (j.workflow_runs || []).filter(r =>
+      r.name === 'openlink ' + sid && new Date(r.created_at).getTime() >= started - 5000);
+    if (!runs.length) return 'unknown';
+    const run = runs[0];
+    if (run.status === 'completed') {
+      if (run.conclusion === 'failure' || run.conclusion === 'cancelled') return 'failed:' + run.html_url;
+      return 'done';
+    }
+    return run.status;
+  } catch (e) {
+    return 'unknown';
   }
 }
 
@@ -1154,12 +1346,23 @@ async function syncWorkspace(s) {
     const url = 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
                encodeURIComponent(s.repo) + '/' + encodeURIComponent(s.branch).replace(/%2F/g, '/') +
                '/uploads/' + encodeURIComponent(sid) + '/workspace.json';
+    // wait for the runner's re-pack to land (stale copy returns null)
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline && !(await fetchWorkspaceResult(s))) await sleep(3000);
     appendSystem('updated workspace: <a href="' + url + '" target="_blank" rel="noopener">download workspace.json</a>', false);
     return;
   }
-  const files = await fetchWorkspaceResult(s);
+  // The runner re-packs the workspace after the turn; wait for the updated copy
+  // (identical content to what we uploaded means it hasn't landed yet).
+  const deadline = Date.now() + 30000;
+  let files = null;
+  while (Date.now() < deadline) {
+    files = await fetchWorkspaceResult(s);
+    if (files) break;
+    await sleep(3000);
+  }
   if (!files) {
-    appendSystem(escapeHtml('folder sync: no workspace result yet — check the Actions run.'), false);
+    appendSystem(escapeHtml('folder sync: the updated workspace has not arrived yet — check the Actions run, or send again.'), false);
     return;
   }
   try {
@@ -1196,20 +1399,59 @@ async function send() {
   if (folderHandle || folderUploadOnly) {
     if (folderHandle) {
       setStatus('dispatching', 'packing folder…');
-      const { files, warnings } = await packFolderToFiles(folderHandle);
+      const { files, warnings, dropped } = await packFolderToFiles(folderHandle);
       folderFiles = files;
-      if (warnings.length) appendSystem(escapeHtml('folder: ' + warnings.join('; ')), false);
+      if (warnings.length) {
+        appendSystem(escapeHtml('folder: ' + warnings.join('; ') + (dropped ? ' (+' + dropped + ' more)' : '')), false);
+      }
     }
-    const okUp = await uploadWorkspace(s);
-    if (!okUp) {
-      fail('Upload failed — the PAT also needs Contents read/write for folder linking.');
+    const chunks = chunkFiles(folderFiles);
+    const manifestJson = JSON.stringify({ chunks: chunks.map(c => c.name) });
+    const up = await uploadWorkspace(s, chunks, manifestJson);
+    if (!up.ok) {
+      let msg = 'Upload failed — HTTP ' + up.status;
+      if (up.status === 0) msg = 'Upload failed — network error' + (up.detail ? ' · ' + up.detail : '');
+      else if (up.status === 401) msg += ' (PAT invalid or expired)';
+      else if (up.status === 403) msg += ' (check the PAT has Contents read/write on this repo)';
+      else if (up.status === 404) msg += ' (repo/path not found — check relay owner/repo/branch)';
+      else if (up.status === 409 || up.status === 422) msg += ' (update conflict)';
+      if (up.status && up.detail) msg += ' · ' + up.detail;
+      fail(msg);
       return;
     }
+    lastUploadedPayload = workspaceSig(manifestJson, chunks.map(c => JSON.stringify({ files: c.files })));
   }
 
   const ok = await dispatch(s, text);
   if (!ok) return;
   await poll(s);
+}
+
+// Restore the conversation + baselines on page load so reloads keep history
+// and the next turn only renders new content.
+async function primeHistory() {
+  const s = loadSettings();
+  if (!s.owner || !s.repo || !s.branch) return;
+  const branchPath = encodeURIComponent(s.branch).replace(/%2F/g, '/');
+  const base = 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
+               encodeURIComponent(s.repo) + '/' + branchPath + '/';
+  const cb = '?cb=' + Date.now();
+  try {
+    const n = await fetch(base + 'sessions/' + sid + '.ndjson' + cb);
+    if (n.status === 200) {
+      const content = await n.text();
+      prevNd = content;
+      if (content.trim()) renderEventsDelta(content);
+    }
+  } catch (e) { /* ignore */ }
+  try {
+    const m = await fetch(base + 'responses/' + sid + '.md' + cb);
+    if (m.status === 200) {
+      const content = await m.text();
+      prevMd = content;
+      if (!prevNd && content.trim()) appendAssistant(renderMarkdown(content));
+    }
+  } catch (e) { /* ignore */ }
 }
 
 // ---------- events ----------
@@ -1267,6 +1509,7 @@ byId('settingsBtn').addEventListener('click', () => {
   setBusy(false);
   setStatus('idle', 'idle');
   inputEl.focus();
+  primeHistory();
 })();
 </script>
 </body>
