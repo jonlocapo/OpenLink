@@ -41,3 +41,11 @@ Let me read the remaining chapters to get the details right.Now I have a full pi
 **Verification:** since I can't view images, I rendered it to PDF via LibreOffice and programmatically checked geometry — all titles fit on one line, no shape exceeds the slide, and the table column-width bug (double `Inches()` conversion) is fixed. It's a `.pptx` you can edit in PowerPoint/Keynote; fill in your name and relatore before using.
 
 Want me to also generate a speaker-notes version or a PDF export?
+## User
+
+I can't see the file
+
+## Agent
+
+
+_Agent error (exit 1): opencode exited with code 1_
