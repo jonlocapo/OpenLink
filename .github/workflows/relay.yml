@@ -110,11 +110,39 @@ jobs:
           restore-keys: |
             openlink-state-${{ env.SID }}-
 
+      # opencode was reinstalled on every turn — the largest fixed cost in a
+      # trivial turn. Cache the binary, refreshed weekly (ISO year-week key);
+      # OPENCODE_DISABLE_AUTOUPDATE keeps a cached binary from drifting.
+      - name: opencode cache key
+        id: ocweek
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore opencode
+        id: oc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.opencode
+          key: openlink-opencode-${{ runner.os }}-${{ steps.ocweek.outputs.week }}
+
       - name: Install opencode
         run: |
-          curl -fsSL https://opencode.ai/install | bash
+          set -euo pipefail
+          # Covers both a cache miss and a corrupt/partial cached copy.
+          if ! "$HOME/.opencode/bin/opencode" --version >/dev/null 2>&1; then
+            curl -fsSL https://opencode.ai/install | bash
+          fi
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           "$HOME/.opencode/bin/opencode" --version
+
+      # Split restore/save rather than actions/cache, whose post step is
+      # post-if: success() — this job deliberately exits non-zero when the
+      # agent fails, and the binary would then never be cached.
+      - name: Save opencode
+        if: steps.oc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.opencode
+          key: openlink-opencode-${{ runner.os }}-${{ steps.ocweek.outputs.week }}
 
       - name: Prepare transcript
         run: |
@@ -181,12 +209,18 @@ jobs:
           # touching the local branch or its index. (A `git reset` here would
           # discard this turn's uncommitted transcript header — the user's
           # message — before the reply is appended.)
+          LAST_TREE=""
           stream_push() {
             rm -f /tmp/stream-index
             GIT_INDEX_FILE=/tmp/stream-index git read-tree --empty 2>/dev/null
             GIT_INDEX_FILE=/tmp/stream-index git add "streams/${SID}.ndjson" 2>/dev/null
             TREE=$(GIT_INDEX_FILE=/tmp/stream-index git write-tree 2>/dev/null)
             [ -z "$TREE" ] && return 1
+            # Identical tree = the agent produced nothing since the last push.
+            # Skip it: a long turn otherwise force-pushes every 5s for minutes,
+            # against GitHub's secondary rate limits, to publish nothing.
+            [ "$TREE" = "$LAST_TREE" ] && return 0
+            LAST_TREE="$TREE"
             PARENT=$(git rev-parse --verify "refs/remotes/origin/stream/${SID}" 2>/dev/null)
             if [ -n "$PARENT" ]; then
               COMMIT=$(printf 'stream %s' "$SID" | git commit-tree "$TREE" -p "$PARENT")

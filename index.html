@@ -599,6 +599,9 @@ let sid = sessionId();
 let prevNd = 0;  // bytes of sessions/<sid>.ndjson already rendered
 let prevMd = 0;  // bytes of responses/<sid>.md already seen
 let busy = false;
+// messageID → live bubble, so a reply streamed across several polls keeps
+// appending to one bubble instead of starting a new one each delta.
+const liveMsgs = new Map();
 
 // ---------- UI helpers ----------
 function setStatus(state, text) {
@@ -1105,49 +1108,67 @@ async function headSha(s, ref) {
   return sha && sha.sha ? sha.sha : (sha === null ? null : '');
 }
 
-// UTF-8 byte length of a string (Range headers and offsets are in bytes,
-// while JS string indices are UTF-16 code units).
-function utf8Len(str) { return new TextEncoder().encode(str).length; }
-
-// Map a UTF-8 byte offset to a code-unit index in str (for slicing a full
-// 200 response whose Range was ignored).
-function codeUnitAtByte(str, byteOffset) {
-  let b = 0;
-  for (let i = 0; i < str.length; i++) {
-    if (b >= byteOffset) return i;
-    const c = str.charCodeAt(i);
-    b += c < 0x80 ? 1 : c < 0x800 ? 2 : (c >= 0xD800 && c <= 0xDFFF) ? 2 : 3;
-  }
-  return str.length;
-}
-
-// Fetch raw content pinned to a commit sha. prevBytes = bytes already seen:
-// asks for bytes=prevBytes- (206 → delta-only body). A 416 means the range
-// starts at/after EOF — we are caught up, not errored. Returns
-// {delta, isPartial, grew, len, caughtUp} or null; len is always a UTF-8 byte
-// count of the whole file (206: prevBytes + body bytes; 200: full body bytes).
-async function fetchRaw(s, sha, path, prevBytes) {
+// Fetch raw content pinned to a commit sha, resuming from an absolute byte
+// offset. Returns null when absent/unreachable, else {delta, len, status} where
+// len is the new absolute byte offset consumed and status is
+// 'grew' | 'same' | 'shrank' ('shrank' = the file was rewritten shorter, which
+// is how the runner truncating the live stream at turn start shows up).
+//
+// Offsets are computed on the raw bytes, never by re-encoding decoded text.
+// Deriving them with utf8Len(body) breaks as soon as a range starts mid-
+// character: response.text() turns the split bytes into U+FFFD, which re-
+// encodes to 3 bytes each, so the offset overshoots the real file length and
+// never recovers.
+//
+// lineAligned (NDJSON): consume only up to the last newline and leave a
+// trailing partial line for the next poll. Without it a record the runner
+// copied mid-write is consumed, fails JSON.parse, and is lost permanently —
+// and the offset is left mid-character, which is what triggers the above.
+// Because '\n' is single-byte, cutting there also guarantees every offset
+// lands on a character boundary.
+async function fetchRaw(s, sha, path, prevBytes, lineAligned) {
   const url = 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
               encodeURIComponent(s.repo) + '/' + sha + '/' + path;
-  const headers = {};
-  if (typeof prevBytes === 'number' && prevBytes > 0) headers['Range'] = 'bytes=' + prevBytes + '-';
+  const from = (typeof prevBytes === 'number' && prevBytes > 0) ? prevBytes : 0;
   let res;
-  try { res = await fetch(url, { headers }); } catch (e) { return null; }
-  if (res.status === 404) return null;
-  if (res.status === 416) return { delta: '', isPartial: false, grew: false, len: prevBytes, caughtUp: true };
+  try {
+    res = await fetch(url, from ? { headers: { 'Range': 'bytes=' + from + '-' } } : {});
+  } catch (e) { return null; }
+
+  // 416 = not longer than our offset: either caught up, or rewritten shorter.
+  // One full read tells them apart (and costs nothing while idle).
+  if (res.status === 416) {
+    let full;
+    try { full = await fetch(url); } catch (e) { return null; }
+    if (full.status !== 200) return null;
+    const n = (await full.arrayBuffer()).byteLength;
+    return n < from ? { delta: '', len: n, status: 'shrank' }
+                    : { delta: '', len: from, status: 'same' };
+  }
   if (res.status !== 200 && res.status !== 206) return null;
-  const body = await res.text();
+
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  let tail;
   if (res.status === 206) {
-    const bytes = utf8Len(body);
-    return { delta: body, isPartial: true, grew: body.length > 0, len: prevBytes + bytes };
+    tail = bytes;                                  // server honoured Range
+  } else {
+    if (bytes.length < from) return { delta: '', len: bytes.length, status: 'shrank' };
+    tail = from ? bytes.subarray(from) : bytes;    // Range ignored → skip the prefix
   }
-  const total = utf8Len(body);
-  if (typeof prevBytes === 'number' && prevBytes >= total) {
-    return { delta: '', isPartial: false, grew: false, len: total, caughtUp: true };
+  if (!tail.length) return { delta: '', len: from, status: 'same' };
+
+  let consumed = tail;
+  if (lineAligned) {
+    let cut = -1;
+    for (let i = tail.length - 1; i >= 0; i--) { if (tail[i] === 0x0A) { cut = i; break; } }
+    if (cut < 0) return { delta: '', len: from, status: 'same' }; // partial line only
+    consumed = tail.subarray(0, cut + 1);
   }
-  const startIdx = (typeof prevBytes === 'number' && prevBytes > 0) ? codeUnitAtByte(body, prevBytes) : 0;
-  const delta = body.slice(startIdx);
-  return { delta, isPartial: false, grew: delta.length > 0, len: total };
+  return {
+    delta: new TextDecoder().decode(consumed),
+    len: from + consumed.length,
+    status: 'grew'
+  };
 }
 
 // ---- chunked workspace transport ----
@@ -1158,11 +1179,16 @@ async function fetchRaw(s, sha, path, prevBytes) {
 
 // 64-bit FNV-1a (two lanes) — chunk identity, not security.
 function fnv1a64(str) {
-  let h1 = 0x811c9dc5, h2 = 0x811c9dc5;
+  // The two lanes must be independent: identical seeds over identical input
+  // keep them bit-identical, making this a 32-bit hash wearing a 64-bit name.
+  // Lane 2 gets its own seed and folds in the position. Keep byte-for-byte
+  // identical across index.html and scripts/repack-workspace.js — delta upload
+  // silently breaks if the two ever disagree on a chunk name.
+  let h1 = 0x811c9dc5, h2 = 0x811c9dc5 ^ 0x9e3779b9;
   for (let i = 0; i < str.length; i++) {
     const c = str.charCodeAt(i);
-    h1 ^= c; h1 = Math.imul(h1, 0x01000193) >>> 0;
-    h2 ^= c; h2 = Math.imul(h2, 0x01000193) >>> 0;
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (c + (i & 0xff)), 0x01000193) >>> 0;
   }
   return ('00000000' + h1.toString(16)).slice(-8) + ('00000000' + h2.toString(16)).slice(-8);
 }
@@ -1319,14 +1345,35 @@ async function poll(s) {
   // ceiling (15 min) plus a grace period has passed.
   const RUN_CEILING_MS = 15 * 60 * 1000 + 60 * 1000;
   const FAIL_GRACE_MS = 15000;
+  // A completed run has already committed (Commit transcript is its last step),
+  // so a short window is enough for the content to become fetchable.
+  const DONE_GRACE_MS = 12000;
   let runLookupDisabled = false;
   let failedAt = 0;
+  let doneAt = 0;
+  let sawError = false;
   let runState = 'unknown';
   let runUrl = '';
-  let lastStreamSha = '';
   let lastMainSha = '';
   let turnPreview = ''; // text seen so far (stream + main), for the notification
   let tickNum = 0;
+  // The runner truncates the live stream at the start of every turn, so the
+  // baseline must start at zero — carrying the previous turn's offset asks for
+  // a range past the end of the fresh file.
+  prevStreamLen = 0;
+  // Ignore whatever the stream branch still holds from the previous turn: only
+  // read it once the runner has pushed a commit for this one.
+  let lastStreamSha = (await headSha(s, 'stream/' + sid)) || '';
+
+  // Both outcomes end here: a failed run still runs "Persist workspace"
+  // (if: always()), so its partial edits are still worth writing back.
+  const finishTurn = async (isError) => {
+    hideThinking();
+    setStatus(isError ? 'error' : 'done', isError ? 'error' : 'done');
+    appendWorkspaceLink(s);
+    await syncWorkspace(s);
+  };
+
   showThinking();
   setStatus('thinking', 'agent thinking… (0s)');
   let lastSec = -1;
@@ -1347,36 +1394,31 @@ async function poll(s) {
         else if (st === 'in_progress') { runState = 'in_progress'; setStatus('thinking', 'agent running…'); }
         else if (st.startsWith('failed:')) {
           if (!failedAt) { failedAt = Date.now(); runUrl = st.slice(7); }
-        } else if (st === 'done') { runState = 'done'; }
+        } else if (st === 'done') { runState = 'done'; if (!doneAt) doneAt = Date.now(); }
       }
 
       // 1) Live stream (stream/<sid> branch): incremental events while the
-      //    agent still works. The runner clears it at turn start; a 416 from
-      //    our stale Range means the file shrank — refetch fully to confirm
-      //    the clear and reset the baseline.
+      //    agent still works. The runner truncates it at turn start, which
+      //    fetchRaw reports directly as 'shrank'.
       const streamSha = await headSha(s, 'stream/' + sid);
       if (streamSha && streamSha !== lastStreamSha) {
         lastStreamSha = streamSha;
-        const res = await fetchRaw(s, streamSha, 'streams/' + sid + '.ndjson', prevStreamLen);
-        if (res) {
-          if (res.caughtUp) {
-            const full = await fetchRaw(s, streamSha, 'streams/' + sid + '.ndjson');
-            if (full && typeof full.len === 'number' && full.len < prevStreamLen) {
-              prevStreamLen = 0; // new turn: the runner cleared the stream
-            }
-          } else if (res.grew && res.delta) {
-            prevStreamLen = res.len;
-            // advance the main-file offset by the bytes just rendered
-            prevNd += utf8Len(res.delta);
-            const r = renderEventsDelta(res.delta);
-            if (r.rendered) hideThinking();
-            if (r.preview) turnPreview += (turnPreview ? ' ' : '') + r.preview;
-            if (r.hadError) {
-              setStatus('error', 'error');
-              notifyUser('OpenLink — turn failed', 'The agent reported an error.');
-              return;
-            }
-          }
+        const res = await fetchRaw(s, streamSha, 'streams/' + sid + '.ndjson', prevStreamLen, true);
+        if (res && res.status === 'shrank') {
+          prevStreamLen = res.len; // new turn: rebase on the truncated file
+        } else if (res && res.status === 'grew') {
+          // Advance main's offset by the same byte count — these exact bytes
+          // are what the runner appends to sessions/<sid>.ndjson at end of
+          // turn, so the authoritative copy won't re-render what we showed.
+          prevNd += res.len - prevStreamLen;
+          prevStreamLen = res.len;
+          const r = renderEventsDelta(res.delta);
+          if (r.rendered) hideThinking();
+          if (r.preview) turnPreview += (turnPreview ? ' ' : '') + r.preview;
+          // Don't bail out here: a failed run still runs "Persist workspace"
+          // (if: always()), so its partial edits are worth writing back. Record
+          // it and let the completion paths below finish the turn properly.
+          if (r.hadError) sawError = true;
         }
       }
 
@@ -1385,48 +1427,43 @@ async function poll(s) {
       const mainSha = await headSha(s, s.branch);
       if (mainSha && mainSha !== lastMainSha) {
         lastMainSha = mainSha;
-        const res = await fetchRaw(s, mainSha, 'sessions/' + sid + '.ndjson', prevNd);
-        if (res && res.grew && res.delta) {
+        const res = await fetchRaw(s, mainSha, 'sessions/' + sid + '.ndjson', prevNd, true);
+        if (res && res.status === 'shrank') {
+          prevNd = res.len; // shouldn't happen (append-only) — resync anyway
+        } else if (res && res.status === 'grew') {
           prevNd = res.len;
           const r = renderEventsDelta(res.delta);
           if (r.rendered) hideThinking();
           if (r.preview) turnPreview += (turnPreview ? ' ' : '') + r.preview;
           // refresh the transcript baseline so a later md fallback renders only new text
-          const m = await fetchRaw(s, mainSha, 'responses/' + sid + '.md');
-          if (m && m.len) prevMd = m.len;
-          if (r.hadError) {
-            setStatus('error', 'error');
-            notifyUser('OpenLink — turn failed', 'The agent reported an error.');
-          } else {
-            setStatus('done', 'done');
-            notifyUser('OpenLink — reply ready', turnPreview || r.preview);
-          }
-          appendWorkspaceLink(s);
-          await syncWorkspace(s);
-          return;
+          const m = await fetchRaw(s, mainSha, 'responses/' + sid + '.md', prevMd, false);
+          if (m && m.status === 'grew') prevMd = m.len;
+          const isError = r.hadError || sawError;
+          if (isError) notifyUser('OpenLink — turn failed', 'The agent reported an error.');
+          else notifyUser('OpenLink — reply ready', turnPreview || r.preview);
+          return await finishTurn(isError);
         }
-        // The run finished and we have seen every byte of the session stream
-        // (416 / unchanged full file) — the turn is complete; finish the
-        // poll and write the folder back instead of spinning to the ceiling.
-        if (res && res.caughtUp && runState === 'done' && lastMainSha) {
-          setStatus('done', 'done');
-          notifyUser('OpenLink — reply ready', turnPreview);
-          appendWorkspaceLink(s);
-          await syncWorkspace(s);
-          return;
-        }
+      }
+
+      // 2b) The run finished and every byte is accounted for — usually because
+      //     the live stream already delivered the whole turn, which makes the
+      //     main copy identical in length (416). Completion follows the run,
+      //     not byte growth, and not a main-branch sha change: a turn with
+      //     nothing to commit never moves that sha at all.
+      if (doneAt && Date.now() - doneAt > DONE_GRACE_MS) {
+        if (sawError) notifyUser('OpenLink — turn failed', 'The agent reported an error.');
+        else notifyUser('OpenLink — reply ready', turnPreview || 'The turn finished.');
+        return await finishTurn(sawError);
       }
 
       // 3) A failed run: give the error content a short grace window to land
       //    (the transcript commit happens just before the run concludes), then
       //    report with the run link.
       if (failedAt && Date.now() - failedAt > FAIL_GRACE_MS) {
-        hideThinking();
         notifyUser('OpenLink — turn failed', 'The workflow run failed.');
         appendSystem(escapeHtml('The workflow run failed: ') +
                      '<a href="' + escapeHtml(runUrl) + '" target="_blank" rel="noopener">' + escapeHtml(runUrl) + '</a>', true);
-        setStatus('error', 'error');
-        return;
+        return await finishTurn(true);
       }
     }
     // ceiling reached
@@ -1494,8 +1531,6 @@ function fmtCost(c) {
 //   - error events → red error bubbles with the message
 // Returns {rendered, hadError, preview}.
 function renderEventsDelta(deltaText) {
-  const msgTexts = {};
-  const msgEls = {};
   let rendered = false;
   let hadError = false;
   let preview = '';
@@ -1546,16 +1581,19 @@ function renderEventsDelta(deltaText) {
     }
     if (e.type === 'text' && typeof part.text === 'string') {
       const id = e.messageID || 'm';
-      if (!msgEls[id]) {
+      // Keyed by messageID across calls, not per call: with live streaming one
+      // reply arrives over many deltas and must land in a single bubble.
+      let msg = liveMsgs.get(id);
+      if (!msg) {
         const b = document.createElement('div');
         b.className = 'bubble agent';
         b.innerHTML = '<span class="who">agent</span><div class="md-body"></div>';
         chatEl.appendChild(b);
-        msgEls[id] = b.querySelector('.md-body');
-        msgTexts[id] = '';
+        msg = { el: b.querySelector('.md-body'), text: '' };
+        liveMsgs.set(id, msg);
       }
-      msgTexts[id] += part.text;
-      msgEls[id].innerHTML = renderMarkdown(msgTexts[id]);
+      msg.text += part.text;
+      msg.el.innerHTML = renderMarkdown(msg.text);
       preview += part.text;
       rendered = true;
       continue;
@@ -1741,15 +1779,15 @@ async function primeHistory() {
   const sha = await headSha(s, s.branch);
   if (!sha) return;
   try {
-    const n = await fetchRaw(s, sha, 'sessions/' + sid + '.ndjson');
-    if (n && n.grew && n.delta) {
+    const n = await fetchRaw(s, sha, 'sessions/' + sid + '.ndjson', 0, true);
+    if (n && n.status === 'grew') {
       prevNd = n.len;
       renderEventsDelta(n.delta);
     }
   } catch (e) { /* ignore */ }
   try {
-    const m = await fetchRaw(s, sha, 'responses/' + sid + '.md');
-    if (m && m.grew && m.delta) {
+    const m = await fetchRaw(s, sha, 'responses/' + sid + '.md', 0, false);
+    if (m && m.status === 'grew') {
       prevMd = m.len;
       if (!prevNd) appendAssistant(renderMarkdown(m.delta));
     }
@@ -1778,6 +1816,7 @@ byId('newBtn').addEventListener('click', () => {
   prevNd = 0;
   prevMd = 0;
   prevStreamLen = 0;
+  liveMsgs.clear();
   lastRunnerTurn = 0;
   lastUploadedChunkNames = null;
   knownRunIds = null;
