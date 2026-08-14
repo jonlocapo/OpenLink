@@ -29,7 +29,7 @@ The laptop never calls the opencode API. The runner does.
 - **A real workspace, two ways**:
   - **Linked local folder** (Chrome/Edge/Firefox): pick a folder on the laptop; it's packed, uploaded before each turn, the agent works on it on the runner, and the changed files are written **back into the local folder** when the turn completes. No repo needed.
   - **GitHub repo**: set `owner/repo[@branch]`; it's cloned on the runner, the agent edits it, and the result is snapshotted to the relay repo's `workspace/<session>` branch — browseable on GitHub.
-- **Live event stream**: the runner publishes the NDJSON event stream to a `stream/<session>` branch every ~5s while the agent works; the UI renders text as it lands plus a live activity trace — `[tool] <name> · <command>` lines and `[step] <reason> · <tokens> · <cost>` lines with running token/cost counts. Thinking blocks appear when the provider streams reasoning content (opencode-go currently doesn't for most models). Reads are commit-pinned (raw.githubusercontent's 5-minute branch-path cache is never hit), so a turn's content is visible one poll interval after it's committed.
+- **Live event stream**: the runner publishes the NDJSON event stream to a `stream/<session>` branch as the agent works (pushed only when it actually grew); the UI renders text as it lands plus a live activity trace — `[tool] <name> · <command>` lines and `[step] <reason> · <tokens> · <cost>` lines with running token/cost counts. Thinking blocks appear when the provider streams reasoning content (opencode-go currently doesn't for most models). Reads are commit-pinned (raw.githubusercontent's 5-minute branch-path cache is never hit), so a turn's content is visible one poll interval after it's committed.
 - **Message queue**: type while a turn is running — messages queue (a `queue: N` chip shows the count) and send automatically when the previous turn finishes.
 - **Turn notifications**: opt-in browser notification when a turn finishes or fails (Settings → "notify when a turn finishes"; permission is requested on enable).
 - **Model + variant picker**: all 24 OpenCode Go models, each with its real effort levels from models.dev (e.g. `gpt-5.6-luna`: none/low/medium/high/xhigh/max, `deepseek-v4-flash`: low/high/max; toggle-style models offer `default` only).
@@ -39,7 +39,7 @@ The laptop never calls the opencode API. The runner does.
 | File | Role |
 |---|---|
 | `index.html` | The whole frontend: chat UI, model/variant picker, target-repo picker, settings (PAT + API key), dispatch + polling. Zero dependencies, single file. |
-| `.github/workflows/relay.yml` | The relay: installs opencode, restores session state, clones the target repo, runs the agent headlessly, appends the event stream, snapshots the workspace, commits the transcript. |
+| `.github/workflows/relay.yml` | The relay: installs opencode (cached, refreshed weekly), restores session state, clones the target repo, runs the agent headlessly, appends the event stream, snapshots the workspace, commits the transcript. |
 
 ## Setup
 
@@ -61,7 +61,7 @@ The laptop never calls the opencode API. The runner does.
 
 1. **Send**: (with a linked folder) the UI packs the folder into chunks of `{"files":[{path, content(base64)}]}` and PUTs them to `uploads/<session>/chunk.NNN.json` (then a `manifest.json` last, so the runner never sees a partial set), then POSTs `POST /repos/{owner}/{repo}/actions/workflows/relay.yml/dispatches` with inputs `{session_id, message, model, variant, repo_spec, workspace_upload, api_key}`.
 2. **Run**: a runner restores the cached opencode session DB, prepares the workspace (unpack the folder upload, or clone the target repo overlaying the previous `workspace/<session>` snapshot), then runs `opencode run <message> --model <model> [--variant v] [--session id] --dir <workspace> --auto --format json` with the Go key from the secret (or the input).
-3. **Persist**: during the turn the event stream is published live to `stream/<session>` (force-pushed ~every 5s); at the end the NDJSON stream is appended to `sessions/<session>.ndjson`, the session DB is re-cached, and the workspace is persisted back (re-packed into `uploads/<session>/manifest.json` + `chunk.<hash>.json` — the manifest is stamped `source:'runner'` with a turn counter — or committed to the `workspace/<session>` branch), plus the plain transcript appended to `responses/<session>.md`.
+3. **Persist**: during the turn the event stream is published live to `stream/<session>` (built with a separate git index so the turn's uncommitted transcript is never touched, and pushed only when the stream grew); at the end the NDJSON stream is appended to `sessions/<session>.ndjson`, the session DB is re-cached, and the workspace is persisted back (re-packed into `uploads/<session>/manifest.json` + `chunk.<hash>.json` — the manifest is stamped `source:'runner'` with a turn counter — or committed to the `workspace/<session>` branch), plus the plain transcript appended to `responses/<session>.md`.
 4. **Receive**: the UI polls the NDJSON (fallback: the `.md` transcript) every 3s and renders only new events: assistant text per message, plus dim `[tool]` activity lines. With a linked folder, the runner's re-packed workspace is then written back into the local folder.
 
 ## Notes & limits

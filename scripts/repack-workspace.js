@@ -18,11 +18,16 @@ const CHUNK_BYTES = 8 * 1024 * 1024;       // 8 MiB decoded per chunk
 // 64-bit FNV-1a (two lanes) — chunk identity, not security. Must match the
 // browser's implementation so unchanged chunks keep their names across turns.
 function fnv1a64(str) {
-  let h1 = 0x811c9dc5, h2 = 0x811c9dc5;
+  // The two lanes must be independent: identical seeds over identical input
+  // keep them bit-identical, making this a 32-bit hash wearing a 64-bit name.
+  // Lane 2 gets its own seed and folds in the position. Keep byte-for-byte
+  // identical across index.html and scripts/repack-workspace.js — delta upload
+  // silently breaks if the two ever disagree on a chunk name.
+  let h1 = 0x811c9dc5, h2 = 0x811c9dc5 ^ 0x9e3779b9;
   for (let i = 0; i < str.length; i++) {
     const c = str.charCodeAt(i);
-    h1 ^= c; h1 = Math.imul(h1, 0x01000193) >>> 0;
-    h2 ^= c; h2 = Math.imul(h2, 0x01000193) >>> 0;
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (c + (i & 0xff)), 0x01000193) >>> 0;
   }
   return ('00000000' + h1.toString(16)).slice(-8) + ('00000000' + h2.toString(16)).slice(-8);
 }
