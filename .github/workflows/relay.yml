@@ -213,7 +213,9 @@ jobs:
           stream_push() {
             rm -f /tmp/stream-index
             GIT_INDEX_FILE=/tmp/stream-index git read-tree --empty 2>/dev/null
-            GIT_INDEX_FILE=/tmp/stream-index git add "streams/${SID}.ndjson" 2>/dev/null
+            # -f: streams/ is gitignored so a cancelled job can never leak the
+            # scratch file onto main via `git add -A`.
+            GIT_INDEX_FILE=/tmp/stream-index git add -f "streams/${SID}.ndjson" 2>/dev/null
             TREE=$(GIT_INDEX_FILE=/tmp/stream-index git write-tree 2>/dev/null)
             [ -z "$TREE" ] && return 1
             # Identical tree = the agent produced nothing since the last push.
@@ -273,8 +275,14 @@ jobs:
             ERRLINE="${ERRLINE:-opencode exited with code $RC}"
             printf '\n_Agent error (exit %s): %s_\n' "$RC" "$ERRLINE" >> "$TRANSCRIPT" || true
             EVENTS_FILE="$EVENTS" ERROR_TEXT="$ERRLINE" RC="$RC" node scripts/append-error.js || true
+            # Reached the error path, so the turn is accounted for.
+            : > /tmp/agent_accounted
             exit "$RC"
           fi
+          # Marker for "Commit transcript": the turn reached a conclusion we
+          # recorded. Its absence means the step was killed (timeout-minutes or
+          # a cancelled run), which no in-step handler can catch.
+          : > /tmp/agent_accounted
 
       - name: Run agent (mock — no API key configured)
         if: env.OPENCODE_API_KEY == '' && env.API_KEY_INPUT == ''
@@ -285,6 +293,7 @@ jobs:
           if [ -f /tmp/agent_workdir ]; then
             printf 'openlink mock round-trip ok\n' > "$(cat /tmp/agent_workdir)/OPENLINK_MOCK.txt"
           fi
+          : > /tmp/agent_accounted
 
       - name: Save agent state
         if: ${{ always() && (env.OPENCODE_API_KEY != '' || env.API_KEY_INPUT != '') }}
@@ -318,6 +327,15 @@ jobs:
         run: |
           git config user.name "openlink-agent"
           git config user.email "openlink-agent@users.noreply.github.com"
+          # A killed step (timeout-minutes, cancelled run) leaves no marker and
+          # cannot report anything itself: the turn would otherwise commit a
+          # user message with an empty reply and no explanation anywhere. Record
+          # it here, where always() still runs.
+          if [ ! -f /tmp/agent_accounted ]; then
+            NOTE="Turn did not complete — the workflow run was cancelled or hit the 15-minute job timeout. Send again, or split the request into smaller steps."
+            printf '\n_%s_\n' "$NOTE" >> "$TRANSCRIPT" || true
+            EVENTS_FILE="$EVENTS" ERROR_TEXT="$NOTE" RC="timeout" node scripts/append-error.js || true
+          fi
           git add -A
           git commit -m "openlink: session ${SID} update" || echo "nothing to commit"
           # The browser uploads to main via the Contents API concurrently;

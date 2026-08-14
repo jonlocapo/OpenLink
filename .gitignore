@@ -1,0 +1,7 @@
+# The live event stream is published to the stream/<session> branch only, via a
+# separate git index — it must never reach main. The relay deletes its scratch
+# copy at the end of a turn, but that cleanup does not run when the job is
+# cancelled or hits timeout-minutes, and `git add -A` in the commit step then
+# captures an empty file permanently. Ignoring the directory makes that
+# impossible regardless of how the run ends (stream_push uses `git add -f`).
+streams/
