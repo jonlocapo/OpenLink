@@ -596,8 +596,8 @@ const inputEl = byId('input');
 const statusEl = byId('status');
 const statusText = byId('statusText');
 let sid = sessionId();
-let prevNd = '';  // last known session event stream (sessions/<sid>.ndjson)
-let prevMd = '';  // last known plain transcript (responses/<sid>.md)
+let prevNd = 0;  // bytes of sessions/<sid>.ndjson already rendered
+let prevMd = 0;  // bytes of responses/<sid>.md already seen
 let busy = false;
 
 // ---------- UI helpers ----------
@@ -1105,29 +1105,49 @@ async function headSha(s, ref) {
   return sha && sha.sha ? sha.sha : (sha === null ? null : '');
 }
 
-// Fetch raw content pinned to a commit sha. Returns {delta, isPartial, grew, len}
-// or null. prevLen = bytes already seen: when given, asks for bytes=prevLen-
-// (206 → delta-only body); a full 200 response is sliced to the tail instead.
-async function fetchRaw(s, sha, path, prevLen) {
+// UTF-8 byte length of a string (Range headers and offsets are in bytes,
+// while JS string indices are UTF-16 code units).
+function utf8Len(str) { return new TextEncoder().encode(str).length; }
+
+// Map a UTF-8 byte offset to a code-unit index in str (for slicing a full
+// 200 response whose Range was ignored).
+function codeUnitAtByte(str, byteOffset) {
+  let b = 0;
+  for (let i = 0; i < str.length; i++) {
+    if (b >= byteOffset) return i;
+    const c = str.charCodeAt(i);
+    b += c < 0x80 ? 1 : c < 0x800 ? 2 : (c >= 0xD800 && c <= 0xDFFF) ? 2 : 3;
+  }
+  return str.length;
+}
+
+// Fetch raw content pinned to a commit sha. prevBytes = bytes already seen:
+// asks for bytes=prevBytes- (206 → delta-only body). A 416 means the range
+// starts at/after EOF — we are caught up, not errored. Returns
+// {delta, isPartial, grew, len, caughtUp} or null; len is always a UTF-8 byte
+// count of the whole file (206: prevBytes + body bytes; 200: full body bytes).
+async function fetchRaw(s, sha, path, prevBytes) {
   const url = 'https://raw.githubusercontent.com/' + encodeURIComponent(s.owner) + '/' +
               encodeURIComponent(s.repo) + '/' + sha + '/' + path;
   const headers = {};
-  if (typeof prevLen === 'number' && prevLen > 0) headers['Range'] = 'bytes=' + prevLen + '-';
+  if (typeof prevBytes === 'number' && prevBytes > 0) headers['Range'] = 'bytes=' + prevBytes + '-';
   let res;
   try { res = await fetch(url, { headers }); } catch (e) { return null; }
   if (res.status === 404) return null;
+  if (res.status === 416) return { delta: '', isPartial: false, grew: false, len: prevBytes, caughtUp: true };
   if (res.status !== 200 && res.status !== 206) return null;
   const body = await res.text();
   if (res.status === 206) {
-    return { delta: body, isPartial: true, grew: body.length > 0, len: null };
+    const bytes = utf8Len(body);
+    return { delta: body, isPartial: true, grew: body.length > 0, len: prevBytes + bytes };
   }
-  if (typeof prevLen === 'number' && body.length > prevLen) {
-    return { delta: body.slice(prevLen), isPartial: false, grew: true, len: body.length };
+  const total = utf8Len(body);
+  if (typeof prevBytes === 'number' && prevBytes >= total) {
+    return { delta: '', isPartial: false, grew: false, len: total, caughtUp: true };
   }
-  if (typeof prevLen === 'number') {
-    return { delta: '', isPartial: false, grew: false, len: body.length };
-  }
-  return { delta: body, isPartial: false, grew: body.length > 0, len: body.length };
+  const startIdx = (typeof prevBytes === 'number' && prevBytes > 0) ? codeUnitAtByte(body, prevBytes) : 0;
+  const delta = body.slice(startIdx);
+  return { delta, isPartial: false, grew: delta.length > 0, len: total };
 }
 
 // ---- chunked workspace transport ----
@@ -1305,6 +1325,7 @@ async function poll(s) {
   let runUrl = '';
   let lastStreamSha = '';
   let lastMainSha = '';
+  let turnPreview = ''; // text seen so far (stream + main), for the notification
   let tickNum = 0;
   showThinking();
   setStatus('thinking', 'agent thinking… (0s)');
@@ -1330,20 +1351,26 @@ async function poll(s) {
       }
 
       // 1) Live stream (stream/<sid> branch): incremental events while the
-      //    agent still works. The runner clears it at turn start, so a shrink
-      //    just resets our baseline.
+      //    agent still works. The runner clears it at turn start; a 416 from
+      //    our stale Range means the file shrank — refetch fully to confirm
+      //    the clear and reset the baseline.
       const streamSha = await headSha(s, 'stream/' + sid);
       if (streamSha && streamSha !== lastStreamSha) {
         lastStreamSha = streamSha;
         const res = await fetchRaw(s, streamSha, 'streams/' + sid + '.ndjson', prevStreamLen);
         if (res) {
-          if (!res.isPartial && res.len < prevStreamLen) {
-            prevStreamLen = res.len; // new turn: the runner cleared the stream
+          if (res.caughtUp) {
+            const full = await fetchRaw(s, streamSha, 'streams/' + sid + '.ndjson');
+            if (full && typeof full.len === 'number' && full.len < prevStreamLen) {
+              prevStreamLen = 0; // new turn: the runner cleared the stream
+            }
           } else if (res.grew && res.delta) {
-            prevStreamLen += res.delta.length;
-            prevNd += res.delta.length; // keep the main-copy delta math aligned
+            prevStreamLen = res.len;
+            // advance the main-file offset by the bytes just rendered
+            prevNd += utf8Len(res.delta);
             const r = renderEventsDelta(res.delta);
             if (r.rendered) hideThinking();
+            if (r.preview) turnPreview += (turnPreview ? ' ' : '') + r.preview;
             if (r.hadError) {
               setStatus('error', 'error');
               notifyUser('OpenLink — turn failed', 'The agent reported an error.');
@@ -1360,9 +1387,10 @@ async function poll(s) {
         lastMainSha = mainSha;
         const res = await fetchRaw(s, mainSha, 'sessions/' + sid + '.ndjson', prevNd);
         if (res && res.grew && res.delta) {
-          prevNd = res.isPartial ? prevNd + res.delta.length : res.len;
+          prevNd = res.len;
           const r = renderEventsDelta(res.delta);
           if (r.rendered) hideThinking();
+          if (r.preview) turnPreview += (turnPreview ? ' ' : '') + r.preview;
           // refresh the transcript baseline so a later md fallback renders only new text
           const m = await fetchRaw(s, mainSha, 'responses/' + sid + '.md');
           if (m && m.len) prevMd = m.len;
@@ -1371,8 +1399,18 @@ async function poll(s) {
             notifyUser('OpenLink — turn failed', 'The agent reported an error.');
           } else {
             setStatus('done', 'done');
-            notifyUser('OpenLink — reply ready', r.preview);
+            notifyUser('OpenLink — reply ready', turnPreview || r.preview);
           }
+          appendWorkspaceLink(s);
+          await syncWorkspace(s);
+          return;
+        }
+        // The run finished and we have seen every byte of the session stream
+        // (416 / unchanged full file) — the turn is complete; finish the
+        // poll and write the folder back instead of spinning to the ceiling.
+        if (res && res.caughtUp && runState === 'done' && lastMainSha) {
+          setStatus('done', 'done');
+          notifyUser('OpenLink — reply ready', turnPreview);
           appendWorkspaceLink(s);
           await syncWorkspace(s);
           return;
@@ -1436,10 +1474,23 @@ async function checkRunStatus(s) {
   return run.status;
 }
 
+function fmtTokens(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return Math.round(n / 1000) + 'K';
+  return String(n);
+}
+function fmtCost(c) {
+  if (!c) return '';
+  if (c >= 0.01) return '$' + c.toFixed(2);
+  if (c >= 0.0001) return '$' + c.toFixed(4);
+  return '<$0.0001';
+}
+
 // Render new NDJSON session events, dispatched by part.type:
 //   - text parts   → agent bubbles (grouped per messageID)
 //   - reasoning    → dim collapsible "thinking" blocks
-//   - tool parts   → `[tool] <name>` activity lines
+//   - tool parts   → `[tool] <name> · <title>` activity lines
+//   - step_finish  → `[step] <reason> · <tokens> · <cost>` activity lines
 //   - error events → red error bubbles with the message
 // Returns {rendered, hadError, preview}.
 function renderEventsDelta(deltaText) {
@@ -1448,6 +1499,13 @@ function renderEventsDelta(deltaText) {
   let rendered = false;
   let hadError = false;
   let preview = '';
+  const addDim = (text) => {
+    const b = document.createElement('div');
+    b.className = 'bubble system dim';
+    b.textContent = text;
+    chatEl.appendChild(b);
+    rendered = true;
+  };
   for (const line of deltaText.split('\n')) {
     if (!line.trim()) continue;
     let e;
@@ -1471,13 +1529,19 @@ function renderEventsDelta(deltaText) {
       rendered = true;
       continue;
     }
+    if (e.type === 'step_finish') {
+      const toks = part.tokens && part.tokens.total;
+      const bits = ['[step] ' + (part.reason || 'done')];
+      if (toks) bits.push(fmtTokens(toks) + ' tokens');
+      if (typeof part.cost === 'number') bits.push(fmtCost(part.cost));
+      addDim(bits.join(' · '));
+      continue;
+    }
     if (part.type === 'tool' || e.type === 'tool') {
       const name = part.tool || part.title || 'tool';
-      const b = document.createElement('div');
-      b.className = 'bubble system dim';
-      b.textContent = '[tool] ' + name;
-      chatEl.appendChild(b);
-      rendered = true;
+      const bits = ['[tool] ' + name];
+      if (part.title && part.title !== name) bits.push(part.title);
+      addDim(bits.join(' · '));
       continue;
     }
     if (e.type === 'text' && typeof part.text === 'string') {
@@ -1497,11 +1561,7 @@ function renderEventsDelta(deltaText) {
       continue;
     }
     if (typeof part.text === 'string') {
-      const b = document.createElement('div');
-      b.className = 'bubble system dim';
-      b.textContent = String(part.text).slice(0, 200);
-      chatEl.appendChild(b);
-      rendered = true;
+      addDim(String(part.text).slice(0, 200));
     }
   }
   if (rendered) scrollBottom();
@@ -1715,8 +1775,8 @@ byId('newBtn').addEventListener('click', () => {
   if (!confirm('Start a new session? The current chat will be cleared.')) return;
   sid = newSessionId();
   store.set(SESSION_KEY, sid);
-  prevNd = '';
-  prevMd = '';
+  prevNd = 0;
+  prevMd = 0;
   prevStreamLen = 0;
   lastRunnerTurn = 0;
   lastUploadedChunkNames = null;
